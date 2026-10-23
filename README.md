@@ -1,7 +1,7 @@
 <!-- RAY-IMAGE README: product overview, research status, and reproducibility guide. -->
 
 <p align="center">
-  <img src="Screenshot_20261014-165136%20%281%29.png" alt="Generated sample image produced by RAY-IMAGE." width="100%" />
+  <img src="Screenshot_20261023-175533%20%282%29.png" alt="Generated sample image produced by RAY-IMAGE." width="100%" />
 </p>
 
 <p align="center">
