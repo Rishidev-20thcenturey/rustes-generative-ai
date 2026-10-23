@@ -73,11 +73,16 @@ The observed pattern is that broad color, atmosphere, texture, and impressionist
 
 ### Target generation path
 
-<p align="center">
-  <img src="assets/ray-image-hero.svg" alt="Illustrative RAY-IMAGE architecture diagram showing the prompt, Qwen text encoder, DiT flow-matching generation, latent representation, and VAE decoding path" width="100%" />
-</p>
-
-<p align="center"><sub>Architecture illustration, not a model-generated sample. The selected checkpoint, VAE, latent convention, and text-conditioning configuration must match for inference.</sub></p>
+```mermaid
+flowchart LR
+    P[Text prompt] --> Q[Frozen Qwen3-4B text encoder]
+    Q --> E[Text embeddings]
+    N[Gaussian noise] --> D[RAYDiT v3 - approximately 60M parameters]
+    E --> D
+    D --> Z[16-channel latent at 32 x 32]
+    Z --> V[Custom VAE v2 decoder]
+    V --> I[256 x 256 RGB image]
+```
 
 The diagram describes the intended v3 generation route. A checkpoint, VAE, latent-space convention, text-conditioning shape, and architecture configuration must match for inference. Not every historical checkpoint is compatible with the current generation entry point.
 
