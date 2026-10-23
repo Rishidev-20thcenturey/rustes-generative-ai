@@ -73,16 +73,17 @@ The observed pattern is that broad color, atmosphere, texture, and impressionist
 
 ### Target generation path
 
-```mermaid
-flowchart LR
-    P[Text prompt] --> Q[Frozen Qwen3-4B text encoder]
-    Q --> E[Text embeddings]
-    N[Gaussian noise] --> D[RAYDiT v3 - approximately 60M parameters]
-    E --> D
-    D --> Z[16-channel latent, 32 x 32]
-    Z --> V[Custom VAE v2 decoder]
-    V --> I[256 x 256 RGB image]
-```
+**Generation pipeline**
+
+| Stage | Component | Role / output |
+|---|---|---|
+| 1. Encode prompt | Frozen Qwen3-4B text encoder | Converts the text prompt into text embeddings (2,560-dimensional hidden states). |
+| 2. Start sampling | Gaussian noise | Provides the initial noisy state for generation. |
+| 3. Generate latent | RAYDiT v3 (approximately 60M parameters) | Uses flow-matching steps conditioned on the prompt embeddings. |
+| 4. Form latent image | 16-channel latent at 32 × 32 | The transformer's sampled latent representation. |
+| 5. Decode | Custom VAE v2 decoder | Converts the latent representation into a 256 × 256 RGB image. |
+
+**In one line:** Text prompt → Qwen3-4B embeddings + Gaussian noise → RAYDiT v3 → 16 × 32 × 32 latent → VAE v2 decoder → 256 × 256 RGB image.
 
 The diagram describes the intended v3 generation route. A checkpoint, VAE, latent-space convention, text-conditioning shape, and architecture configuration must match for inference. Not every historical checkpoint is compatible with the current generation entry point.
 
