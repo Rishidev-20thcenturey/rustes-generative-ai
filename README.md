@@ -73,23 +73,16 @@ The observed pattern is that broad color, atmosphere, texture, and impressionist
 
 ### Target generation path
 
-~~~mermaid
+```mermaid
 flowchart LR
-    P["Text prompt"] --> Q["Frozen Qwen3-4B"]
-    Q --> E["Text context<br/>hidden size 2,560"]
-    N["Gaussian noise"] --> D["RAYDiT v3<br/>flow-matching transformer"]
+    P[Text prompt] --> Q[Frozen Qwen3-4B text encoder]
+    Q --> E[Text embeddings]
+    N[Gaussian noise] --> D[RAYDiT v3 - approximately 60M parameters]
     E --> D
-    D --> Z["16 × 32 × 32 latent"]
-    Z --> V["Custom VAE v2 decoder"]
-    V --> I["256 × 256 RGB image"]
-
-    classDef input fill:#17243a,stroke:#617b9c,color:#f3f6ff
-    classDef model fill:#1b2c37,stroke:#57c9bc,color:#f3f6ff
-    classDef output fill:#352b29,stroke:#f59a60,color:#fff6ef
-    class P,N input
-    class Q,E,D,Z,V model
-    class I output
-~~~
+    D --> Z[16-channel latent, 32 x 32]
+    Z --> V[Custom VAE v2 decoder]
+    V --> I[256 x 256 RGB image]
+```
 
 The diagram describes the intended v3 generation route. A checkpoint, VAE, latent-space convention, text-conditioning shape, and architecture configuration must match for inference. Not every historical checkpoint is compatible with the current generation entry point.
 
