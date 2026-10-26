@@ -519,7 +519,17 @@ def build_ema_payload(ema, step: int, config: dict) -> dict:
 
 
 def prune_local_checkpoints(out_dir: Path, keep: int) -> None:
-    """Keep the newest `keep` files of EACH kind (full and EMA-only)."""
+    """Keep the newest `keep` files of EACH kind (full and EMA-only).
+
+    Also removes stale *.pt.tmp files left by a save that crashed before os.replace.
+    Saves run one at a time, so no live .tmp file can be in progress here.
+    """
+    for stale in out_dir.glob("*.pt.tmp"):
+        try:
+            stale.unlink()
+            print(f"[local cleanup] removed stale temp file {stale.name}")
+        except OSError as exc:
+            print(f"[local cleanup] failed to remove {stale.name}: {exc}")
     for prefix in CKPT_PREFIXES:
         files = sorted(out_dir.glob(f"{prefix}*.pt"), key=lambda p: _step_of(p.name))
         for path in files[:-keep]:
