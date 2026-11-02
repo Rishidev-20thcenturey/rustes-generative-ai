@@ -4,7 +4,7 @@ Data pipeline, windows, replay buffer, checkpoint policy and recipe are the same
 train_dit_v4.py. Those helpers are imported from it. Changes in this file:
   * RAYDiT_v5 (dit_v5_moe.py): MoE feed-forwards.
   * Loss: total = mse + aux_loss_weight * load_balancing + z_loss_weight * router_z.
-  * --warm-start-from: copy a v4 checkpoint into all experts (fresh step counter).
+  * --warm-start-from: copy a v4 checkpoint into all experts; training continues at the v4 step.
   * --resume: loads a v5 checkpoint with strict=True. Architecture checked (RB-11).
   * v5 file names and HF repos (ray-image-dit-v5-moe).
 
@@ -17,6 +17,7 @@ import argparse
 import copy
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from .dit_v5_moe import (
     MOE_ROUTER_JITTER,
     MOE_TOP_K,
     RAYDiT_v5,
+    WARM_START_DOWN_SCALE,
     warm_start_from_v4,
 )
 from .train_dit_v4 import (
@@ -53,7 +55,6 @@ from .train_dit_v4 import (
     HF_UPLOAD_EVERY,
     LATENT_SPACE,
     LOCAL_CHECKPOINT_DIR,
-    LOCAL_KEEP,
     LOG_EVERY,
     MILESTONE_EVERY,
     REPLAY_FILENAME,
@@ -84,6 +85,8 @@ EMA_CKPT_PREFIX = "ray_dit_v5_ema_step_"
 CKPT_PREFIXES = (CKPT_PREFIX, EMA_CKPT_PREFIX)
 STAGE_NAME = "dit_v5_moe"
 ARCH_NAME = "dit_v5_moe"
+# Local retention for v5 (decision): 2 full + 2 EMA = about 19.2 GB at 482M params.
+LOCAL_KEEP_V5 = 2
 
 # Set in main() from the CLI (read by the checkpoint provenance block).
 CAPTION_DROP = 0.10
@@ -154,7 +157,7 @@ def build_config(args) -> dict:
     return config
 
 
-def train_step(dit, ema, optimizer, batch, null_emb_full, null_mask_full, args, device):
+def train_step(dit, ema, optimizer, scaler, batch, null_emb_full, null_mask_full, args, device):
     """One optimiser step.
 
     Returns (stats dict or None if skipped, number of dropped captions).
@@ -180,12 +183,16 @@ def train_step(dit, ema, optimizer, batch, null_emb_full, null_mask_full, args, 
     if not torch.isfinite(loss).item():
         optimizer.zero_grad(set_to_none=True)
         return None, int(dropped)
-    loss.backward()
+    # fp16 autocast needs loss scaling. GradScaler is a no-op when disabled (CPU).
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)  # so clipping sees the true gradient norm
     grad_norm = torch.nn.utils.clip_grad_norm_(dit.parameters(), GRAD_CLIP)
+    # scaler.step skips the update if any gradient is inf/NaN, and scaler.update lowers the scale.
+    scaler.step(optimizer)
+    scaler.update()
     if not torch.isfinite(grad_norm).item():
         optimizer.zero_grad(set_to_none=True)
         return None, int(dropped)
-    optimizer.step()
     update_ema(ema, dit, args.ema_decay)
     stats = {"loss": float(loss.item()), "mse": float(mse.item()),
              "lb": float(lb_loss.item()), "z": float(z_loss.item())}
@@ -196,8 +203,8 @@ def train_step(dit, ema, optimizer, batch, null_emb_full, null_mask_full, args, 
 # Checkpoints (same policy as v4: local keep-4, HF main keep-4 per kind, milestones kept)
 # --------------------------------------------------------------------------
 
-def build_full_payload(dit, optimizer, ema, step: int, seed: int, window_index: int, config: dict) -> dict:
-    return {
+def build_full_payload(dit, optimizer, ema, scaler, step: int, seed: int, window_index: int, config: dict) -> dict:
+    payload = {
         "stage": STAGE_NAME,
         "step": step,
         "window": window_index,
@@ -207,6 +214,9 @@ def build_full_payload(dit, optimizer, ema, step: int, seed: int, window_index: 
         "ema": ema.state_dict(),
         "optimizer": optimizer.state_dict(),
     }
+    if scaler is not None and scaler.is_enabled():
+        payload["scaler"] = scaler.state_dict()
+    return payload
 
 
 def build_ema_payload(ema, step: int, config: dict) -> dict:
@@ -231,7 +241,7 @@ def prune_local_checkpoints(out_dir: Path, keep: int) -> None:
                 print(f"[local cleanup] failed to delete {path.name}: {exc}")
 
 
-def save_local_checkpoint(out_dir: Path, dit, optimizer, ema, step: int, seed: int,
+def save_local_checkpoint(out_dir: Path, dit, optimizer, ema, scaler, step: int, seed: int,
                           window_index: int, args):
     """Write both files for this step. Returns (full_path, ema_path), or None if skipped."""
     if log_disk_usage(out_dir) > DISK_REFUSE_SAVE_PCT:
@@ -244,14 +254,14 @@ def save_local_checkpoint(out_dir: Path, dit, optimizer, ema, step: int, seed: i
     full_path = out_dir / f"{CKPT_PREFIX}{step:07d}.pt"
     ema_path = out_dir / f"{EMA_CKPT_PREFIX}{step:07d}.pt"
     for path, payload in (
-        (full_path, build_full_payload(dit, optimizer, ema, step, seed, window_index, config)),
+        (full_path, build_full_payload(dit, optimizer, ema, scaler, step, seed, window_index, config)),
         (ema_path, build_ema_payload(ema, step, config)),
     ):
         tmp = out_dir / (path.name + ".tmp")
         torch.save(payload, tmp)
         os.replace(tmp, path)
     print(f"[checkpoint] saved {full_path.name} + {ema_path.name}")
-    prune_local_checkpoints(out_dir, LOCAL_KEEP)
+    prune_local_checkpoints(out_dir, LOCAL_KEEP_V5)
     return full_path, ema_path
 
 
@@ -285,7 +295,7 @@ def upload_milestone_checkpoints(api: HfApi, paths, repo_id: str, step: int) -> 
         print(f"[milestone] uploaded {path.name} -> {repo_id}")
 
 
-def load_resume(path: Path, dit, optimizer, ema, args) -> int:
+def load_resume(path: Path, dit, optimizer, ema, scaler, args) -> int:
     """Resume a v5 checkpoint. Loaded to CPU first, so the GPU never holds two full copies."""
     if not path.is_file():
         raise FileNotFoundError(f"resume checkpoint not found: {path}")
@@ -294,6 +304,8 @@ def load_resume(path: Path, dit, optimizer, ema, args) -> int:
     dit.load_state_dict(data["dit"], strict=True)
     if "optimizer" in data:
         optimizer.load_state_dict(data["optimizer"])
+    if scaler.is_enabled() and "scaler" in data:
+        scaler.load_state_dict(data["scaler"])
     if "ema" in data:
         ema.load_state_dict(data["ema"], strict=True)
     else:
@@ -304,15 +316,34 @@ def load_resume(path: Path, dit, optimizer, ema, args) -> int:
     return step
 
 
-def load_warm_start(path: Path, dit, ema) -> None:
-    """Copy a v4 checkpoint's FFN weights into every expert (see dit_v5_moe.warm_start_from_v4)."""
+def load_warm_start(path: Path, dit, ema) -> int:
+    """Copy a v4 checkpoint's FFN weights into every expert. Returns the v4 step to continue from.
+
+    The step comes from the checkpoint's "step" field, or from "step_NNNNNNN" in the file name.
+    Continuing the v4 count keeps the LR schedule and the milestone step numbers consistent.
+    """
     if not path.is_file():
         raise FileNotFoundError(f"warm-start checkpoint not found: {path}")
     data = torch.load(path, map_location="cpu", weights_only=False)
+    step = data.get("step") if isinstance(data, dict) else None
+    if step is None:
+        match = re.search(r"step_(\d+)", path.name)
+        if match is None:
+            raise ValueError(f"cannot determine the v4 step for {path.name}: no 'step' field and no step_NNNNNNN in the name")
+        step = int(match.group(1))
     v4_state = data["dit"] if "dit" in data else data
     warm_start_from_v4(dit, v4_state)
     ema.load_state_dict(dit.state_dict(), strict=True)
-    print(f"[warm start] copied {path.name} (v4 FFN -> all experts); step counter starts at 0")
+    print(f"[warm start] copied {path.name} (v4 FFN -> all experts, down-proj x{WARM_START_DOWN_SCALE}); "
+          f"continuing at step {int(step)}. Fresh optimizer and empty replay buffer.")
+    return int(step)
+
+
+def open_window(index: int, chunk_indices, cache_dir: Path, cache_repo: str):
+    """The only place training data is opened. The trainer uses the returned object through
+    load(), sample_training_batch(), replay.absorb() and release(). To change the data format
+    (for example WebDataset or Parquet streaming), replace this function and keep that interface."""
+    return Window(index, chunk_indices, cache_dir, cache_repo)
 
 
 # --------------------------------------------------------------------------
@@ -404,11 +435,13 @@ def main():
     ema = copy.deepcopy(dit)
     ema.requires_grad_(False)
     ema.eval()
+    # fp16 autocast on a T4 needs loss scaling. The scaler is disabled on CPU.
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     step = 0
     if args.resume:
-        step = load_resume(Path(args.resume), dit, optimizer, ema, args)
+        step = load_resume(Path(args.resume), dit, optimizer, ema, scaler, args)
     elif args.warm_start_from:
-        load_warm_start(Path(args.warm_start_from), dit, ema)
+        step = load_warm_start(Path(args.warm_start_from), dit, ema)
     else:
         print("[init] WARNING: no --resume or --warm-start-from; training from random init")
     if step >= args.steps:
@@ -446,14 +479,14 @@ def main():
         w = step // WINDOW_STEPS
         window_end = min((w + 1) * WINDOW_STEPS, args.steps)
         if window is None:
-            window = Window(w, windows[w], cache_dir, args.cache_repo)
+            window = open_window(w, windows[w], cache_dir, args.cache_repo)
             window.load()
             print(f"[window {w}] steps {step + 1}..{window_end}")
         while step < window_end:
             step += 1
             set_learning_rate(optimizer, args.lr, step)
             batch = sample_training_batch(window, replay, args.batch_size, device)
-            stats, dropped = train_step(dit, ema, optimizer, batch, null_emb_full, null_mask_full, args, device)
+            stats, dropped = train_step(dit, ema, optimizer, scaler, batch, null_emb_full, null_mask_full, args, device)
             seen_total += args.batch_size
             dropped_total += dropped
             if stats is not None:
@@ -477,7 +510,7 @@ def main():
                 seen_total = 0
 
             if step % CHECKPOINT_EVERY == 0 or step == args.steps:
-                saved = save_local_checkpoint(out_dir, dit, optimizer, ema, step, args.seed, w, args)
+                saved = save_local_checkpoint(out_dir, dit, optimizer, ema, scaler, step, args.seed, w, args)
                 if saved is not None and upload:
                     if step % HF_UPLOAD_EVERY == 0 or step == args.steps:
                         try:

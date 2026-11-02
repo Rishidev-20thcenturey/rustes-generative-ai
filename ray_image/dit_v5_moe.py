@@ -65,10 +65,10 @@ class MoELayer(nn.Module):
       * last_dropped_fraction holds the fraction of routed assignments dropped in the
         most recent forward pass. It is for logging only.
       * The top_k weights are a softmax over the selected logits, so they sum to 1.
-        With identical expert weights (the warm start), the routed part equals FFN(x)
-        exactly, unless assignments are dropped. The shared expert adds another FFN(x).
-        So at init the MoE output is about 2 * FFN(x), whatever the router. Dropped
-        assignments reduce it. Training has to absorb this scale.
+        With the warm start (down-projections scaled by WARM_START_DOWN_SCALE = 0.5),
+        the routed part is 0.5 * FFN(x) and the shared expert adds 0.5 * FFN(x). So at
+        init the MoE output equals FFN(x), whatever the router, unless assignments are
+        dropped. Dropped assignments reduce it.
     """
 
     def __init__(
@@ -290,12 +290,19 @@ class RAYDiT_v5(nn.Module):
         return sum(values) / max(len(values), 1)
 
 
+WARM_START_DOWN_SCALE = 0.5  # applied to every copied down-projection (see warm_start_from_v4)
+
+
 def warm_start_from_v4(model: RAYDiT_v5, v4_state: dict) -> None:
     """Load a RAYDiT_v4 state dict into RAYDiT_v5.
 
     * Every non-FFN key is copied one-to-one.
     * Each block's dense FFN (blocks.i.ffn.{gate,up,down}.weight) is copied into every routed
       expert (blocks.i.moe.experts.e.*) and every shared expert (blocks.i.moe.shared_experts.s.*).
+    * The down-projection is multiplied by WARM_START_DOWN_SCALE (0.5) in every copy. The
+      routed top-k weights sum to 1, so the routed part is 0.5*FFN(x) and the shared expert
+      adds 0.5*FFN(x). Together they give FFN(x) at init (no capacity drops), so the
+      residual branch keeps its v4 scale instead of doubling.
     * The router (blocks.i.moe.router.*) keeps its fresh initialisation.
 
     The key sets are checked exactly and the load is strict. A mismatch raises.
@@ -306,10 +313,11 @@ def warm_start_from_v4(model: RAYDiT_v5, v4_state: dict) -> None:
     for key, value in v4_state.items():
         if ".ffn." in key:
             prefix, rest = key.split(".ffn.", 1)
+            scaled = value * WARM_START_DOWN_SCALE if rest.startswith("down.") else value
             for e in range(model.num_experts):
-                new_state[f"{prefix}.moe.experts.{e}.{rest}"] = value.clone()
+                new_state[f"{prefix}.moe.experts.{e}.{rest}"] = scaled.clone()
             for s in range(model.num_shared_experts):
-                new_state[f"{prefix}.moe.shared_experts.{s}.{rest}"] = value.clone()
+                new_state[f"{prefix}.moe.shared_experts.{s}.{rest}"] = scaled.clone()
         else:
             new_state[key] = value
     for key in router_keys:
