@@ -64,10 +64,11 @@ class MoELayer(nn.Module):
     Notes:
       * last_dropped_fraction holds the fraction of routed assignments dropped in the
         most recent forward pass. It is for logging only.
-      * With identical expert weights (the warm start), the routed part adds
-        sum(top_k weights) * FFN(x). The shared expert adds FFN(x) on top, so the total
-        is (1 + sum of top_k weights) * FFN(x). With a zero router that is 2 * FFN(x).
-        Training has to absorb this scale.
+      * The top_k weights are a softmax over the selected logits, so they sum to 1.
+        With identical expert weights (the warm start), the routed part equals FFN(x)
+        exactly, unless assignments are dropped. The shared expert adds another FFN(x).
+        So at init the MoE output is about 2 * FFN(x), whatever the router. Dropped
+        assignments reduce it. Training has to absorb this scale.
     """
 
     def __init__(
