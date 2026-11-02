@@ -199,11 +199,28 @@ def train_step(dit, ema, optimizer, scaler, batch, null_emb_full, null_mask_full
     return stats, int(dropped)
 
 
+def set_v5_learning_rate(optimizer, base_lr: float, step: int, ramp_start, warmup_steps: int) -> float:
+    """LR for v5. Without a ramp this is the v4 schedule. With a ramp (warm start, or resume
+    inside one), the LR is 0 at ramp_start and rises linearly to base_lr over warmup_steps.
+    This keeps the fresh Adam moments from taking full-size steps at once."""
+    if ramp_start is None:
+        return set_learning_rate(optimizer, base_lr, step)
+    if warmup_steps <= 0:
+        progress = 1.0
+    else:
+        progress = min(max((step - ramp_start) / warmup_steps, 0.0), 1.0)
+    lr = base_lr * progress
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
 # --------------------------------------------------------------------------
 # Checkpoints (same policy as v4: local keep-4, HF main keep-4 per kind, milestones kept)
 # --------------------------------------------------------------------------
 
-def build_full_payload(dit, optimizer, ema, scaler, step: int, seed: int, window_index: int, config: dict) -> dict:
+def build_full_payload(dit, optimizer, ema, scaler, step: int, seed: int, window_index: int, config: dict,
+                       lr_ramp=None) -> dict:
     payload = {
         "stage": STAGE_NAME,
         "step": step,
@@ -216,6 +233,8 @@ def build_full_payload(dit, optimizer, ema, scaler, step: int, seed: int, window
     }
     if scaler is not None and scaler.is_enabled():
         payload["scaler"] = scaler.state_dict()
+    if lr_ramp is not None:
+        payload["lr_ramp"] = {"start": int(lr_ramp[0]), "steps": int(lr_ramp[1])}
     return payload
 
 
@@ -242,7 +261,7 @@ def prune_local_checkpoints(out_dir: Path, keep: int) -> None:
 
 
 def save_local_checkpoint(out_dir: Path, dit, optimizer, ema, scaler, step: int, seed: int,
-                          window_index: int, args):
+                          window_index: int, args, lr_ramp=None):
     """Write both files for this step. Returns (full_path, ema_path), or None if skipped."""
     if log_disk_usage(out_dir) > DISK_REFUSE_SAVE_PCT:
         print(f"[checkpoint] SKIP step={step}: disk above {DISK_REFUSE_SAVE_PCT:.0f}%")
@@ -254,7 +273,7 @@ def save_local_checkpoint(out_dir: Path, dit, optimizer, ema, scaler, step: int,
     full_path = out_dir / f"{CKPT_PREFIX}{step:07d}.pt"
     ema_path = out_dir / f"{EMA_CKPT_PREFIX}{step:07d}.pt"
     for path, payload in (
-        (full_path, build_full_payload(dit, optimizer, ema, scaler, step, seed, window_index, config)),
+        (full_path, build_full_payload(dit, optimizer, ema, scaler, step, seed, window_index, config, lr_ramp)),
         (ema_path, build_ema_payload(ema, step, config)),
     ):
         tmp = out_dir / (path.name + ".tmp")
@@ -295,7 +314,8 @@ def upload_milestone_checkpoints(api: HfApi, paths, repo_id: str, step: int) -> 
         print(f"[milestone] uploaded {path.name} -> {repo_id}")
 
 
-def load_resume(path: Path, dit, optimizer, ema, scaler, args) -> int:
+def load_resume(path: Path, dit, optimizer, ema, scaler, args):
+    """Returns (step, lr_ramp). lr_ramp is (start, steps) if the checkpoint was saved inside a ramp, else None."""
     """Resume a v5 checkpoint. Loaded to CPU first, so the GPU never holds two full copies."""
     if not path.is_file():
         raise FileNotFoundError(f"resume checkpoint not found: {path}")
@@ -312,11 +332,13 @@ def load_resume(path: Path, dit, optimizer, ema, scaler, args) -> int:
         print("[resume] WARNING: checkpoint has no EMA weights; EMA restarts from the loaded DiT weights")
         ema.load_state_dict(dit.state_dict(), strict=True)
     step = int(data.get("step", 0))
-    print(f"[resume] loaded {path.name} at step {step} (strict)")
-    return step
+    ramp = data.get("lr_ramp")
+    lr_ramp = (int(ramp["start"]), int(ramp["steps"])) if ramp else None
+    print(f"[resume] loaded {path.name} at step {step} (strict); lr ramp={lr_ramp}")
+    return step, lr_ramp
 
 
-def load_warm_start(path: Path, dit, ema) -> int:
+def load_warm_start(path: Path, dit, ema, warmup_steps: int) -> int:
     """Copy a v4 checkpoint's FFN weights into every expert. Returns the v4 step to continue from.
 
     The step comes from the checkpoint's "step" field, or from "step_NNNNNNN" in the file name.
@@ -336,6 +358,7 @@ def load_warm_start(path: Path, dit, ema) -> int:
     ema.load_state_dict(dit.state_dict(), strict=True)
     print(f"[warm start] copied {path.name} (v4 FFN -> all experts, down-proj x{WARM_START_DOWN_SCALE}); "
           f"continuing at step {int(step)}. Fresh optimizer and empty replay buffer.")
+    print(f"[warm start] LR ramps from 0 at step {int(step)} to the target LR over {warmup_steps} steps")
     return int(step)
 
 
@@ -368,6 +391,8 @@ def parse_args():
                         help="Local v5 checkpoint (.pt) to resume from. Loaded with strict=True.")
     parser.add_argument("--warm-start-from", type=str, default=None,
                         help="Local v4 checkpoint (.pt). Its FFN weights are copied into every expert.")
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="With --warm-start-from: LR ramps linearly from 0 to --lr over this many steps.")
     parser.add_argument("--output-dir", type=str, default=LOCAL_CHECKPOINT_DIR)
     parser.add_argument("--no-hf-upload", action="store_true")
     parser.add_argument("--caption-drop", type=float, default=0.10)
@@ -386,6 +411,8 @@ def main():
     args = parse_args()
     if args.steps < 0 or args.batch_size <= 0 or args.lr <= 0:
         raise ValueError("--steps must be >= 0, --batch-size > 0, --lr > 0")
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be >= 0")
     if args.cache_window < 1 or args.replay_buffer < 0:
         raise ValueError("--cache-window must be >= 1 and --replay-buffer >= 0")
     if not 0.0 <= args.caption_drop <= 1.0:
@@ -438,10 +465,12 @@ def main():
     # fp16 autocast on a T4 needs loss scaling. The scaler is disabled on CPU.
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     step = 0
+    lr_ramp = None  # (start_step, steps) while the LR is ramping; None = plain v4 schedule
     if args.resume:
-        step = load_resume(Path(args.resume), dit, optimizer, ema, scaler, args)
+        step, lr_ramp = load_resume(Path(args.resume), dit, optimizer, ema, scaler, args)
     elif args.warm_start_from:
-        step = load_warm_start(Path(args.warm_start_from), dit, ema)
+        step = load_warm_start(Path(args.warm_start_from), dit, ema, args.warmup_steps)
+        lr_ramp = (step, args.warmup_steps) if args.warmup_steps > 0 else None
     else:
         print("[init] WARNING: no --resume or --warm-start-from; training from random init")
     if step >= args.steps:
@@ -484,7 +513,8 @@ def main():
             print(f"[window {w}] steps {step + 1}..{window_end}")
         while step < window_end:
             step += 1
-            set_learning_rate(optimizer, args.lr, step)
+            set_v5_learning_rate(optimizer, args.lr, step, lr_ramp[0] if lr_ramp else None,
+                                 lr_ramp[1] if lr_ramp else 0)
             batch = sample_training_batch(window, replay, args.batch_size, device)
             stats, dropped = train_step(dit, ema, optimizer, scaler, batch, null_emb_full, null_mask_full, args, device)
             seen_total += args.batch_size
@@ -510,7 +540,7 @@ def main():
                 seen_total = 0
 
             if step % CHECKPOINT_EVERY == 0 or step == args.steps:
-                saved = save_local_checkpoint(out_dir, dit, optimizer, ema, scaler, step, args.seed, w, args)
+                saved = save_local_checkpoint(out_dir, dit, optimizer, ema, scaler, step, args.seed, w, args, lr_ramp)
                 if saved is not None and upload:
                     if step % HF_UPLOAD_EVERY == 0 or step == args.steps:
                         try:
