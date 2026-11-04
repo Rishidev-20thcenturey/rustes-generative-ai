@@ -15,6 +15,19 @@ def sample_flow_pair(x0: torch.Tensor):
     return xt, t, target
 
 
+def predict_velocity_tensor(model, x, t, text, text_mask=None):
+    """Velocity tensor from any DiT, for sampling.
+
+    Models with a ``predict_velocity`` method (RAYDiT_v5) return the tensor directly.
+    Otherwise ``forward`` is called, and a tuple result (prediction, aux losses...) is
+    reduced to its first element. Sampling never sees auxiliary losses.
+    """
+    if hasattr(model, "predict_velocity"):
+        return model.predict_velocity(x, t, text, text_mask=text_mask)
+    out = model(x, t, text, text_mask=text_mask)
+    return out[0] if isinstance(out, tuple) else out
+
+
 @torch.no_grad()
 def euler_sample(model, text, shape, steps=20, device=None, text_mask=None,
                  cfg_scale=1.0, null_text=None, null_mask=None):
@@ -36,9 +49,9 @@ def euler_sample(model, text, shape, steps=20, device=None, text_mask=None,
     for i in range(steps):
         t = torch.full((shape[0],), 1.0 - i * dt, device=device)
         # Training uses data->noise; sampling follows noise->data.
-        v = model(x, t, text, text_mask=text_mask)
+        v = predict_velocity_tensor(model, x, t, text, text_mask)
         if use_cfg:
-            v_uncond = model(x, t, null_text, text_mask=null_mask)
+            v_uncond = predict_velocity_tensor(model, x, t, null_text, null_mask)
             v = v_uncond + cfg_scale * (v - v_uncond)
         x = x - dt * v
     return x

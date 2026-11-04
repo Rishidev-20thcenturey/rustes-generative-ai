@@ -238,9 +238,12 @@ class RAYDiT_v5(nn.Module):
         text: torch.Tensor,
         text_mask: torch.Tensor | None = None,
         checkpoint_blocks: bool = False,
+        return_losses: bool = True,
     ):
-        """Returns (prediction, load_balancing_loss, router_z_loss), losses averaged over layers.
+        """Training forward. Returns (prediction, load_balancing_loss, router_z_loss) by default.
 
+        return_losses=False returns only the prediction tensor, the same shape as v4's forward.
+        Use predict_velocity() for inference rather than passing this flag by hand.
         checkpoint_blocks=True recomputes each block in the backward pass (training only).
         """
         if z.ndim != 4:
@@ -282,7 +285,17 @@ class RAYDiT_v5(nn.Module):
         x = self.out(self.norm(x))
         x = x.view(b, ph, pw, self.patch, self.patch, self.latent_channels)
         prediction = x.permute(0, 5, 1, 3, 2, 4).reshape(b, self.latent_channels, h, w)
+        if not return_losses:
+            return prediction
         return prediction, lb_total / self.depth, z_total / self.depth
+
+    def predict_velocity(self, z: torch.Tensor, t: torch.Tensor, text: torch.Tensor,
+                         text_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Inference entry point: predicted velocity tensor only, no auxiliary losses.
+
+        Call it in eval mode (no router jitter, no block checkpointing).
+        """
+        return self.forward(z, t, text, text_mask=text_mask, return_losses=False)
 
     def dropped_fraction(self) -> float:
         """Mean fraction of routed assignments dropped by capacity in the last forward pass."""
