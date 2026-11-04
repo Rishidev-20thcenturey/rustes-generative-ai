@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from huggingface_hub import HfApi, create_repo, hf_hub_download
+from huggingface_hub import HfApi, constants, create_repo, hf_hub_download
 from torch.optim import AdamW
 from torch.utils.checkpoint import checkpoint
 
@@ -241,6 +241,35 @@ def gather_from_payloads(payloads, offsets_t: torch.Tensor, global_idx: torch.Te
     return lat, txt, msk
 
 
+def purge_hub_cache_for_repo(repo_id: str, repo_type: str = "dataset") -> int:
+    """Delete this repo's folder in the Hugging Face hub cache (HF_HUB_CACHE). Returns bytes freed.
+
+    Only the single folder <HF_HUB_CACHE>/<datasets|models>--<org>--<name> is removed. A name
+    check and a parent check guard the rmtree. Failures are logged and never raised, so a
+    cleanup problem cannot stop training.
+    """
+    prefix = {"dataset": "datasets", "model": "models"}.get(repo_type)
+    if prefix is None:
+        print(f"[hub cache] skip purge: unsupported repo_type {repo_type!r}")
+        return 0
+    try:
+        root = Path(constants.HF_HUB_CACHE).expanduser().resolve()
+        target = root / f"{prefix}--{repo_id.replace('/', '--')}"
+        if not target.exists():
+            return 0
+        target = target.resolve()
+        if target.parent != root or not target.name.startswith(f"{prefix}--"):
+            print(f"[hub cache] refusing to purge unexpected path {target}")
+            return 0
+        freed = sum(f.stat().st_size for f in target.rglob("*") if f.is_file() and not f.is_symlink())
+        shutil.rmtree(target)
+        print(f"[hub cache] purged {target.name}: freed {freed / 1e9:.2f} GB")
+        return freed
+    except OSError as exc:
+        print(f"[hub cache] WARNING: purge of {repo_id} failed: {exc}")
+        return 0
+
+
 class Window:
     """The chunks of one training window, loaded for sampling."""
 
@@ -276,7 +305,11 @@ class Window:
         return gather_from_payloads(self.payloads, self.offsets_t, global_idx, self.text_len)
 
     def release(self) -> None:
-        """Drop the memory maps, then delete this window's chunk files."""
+        """Drop the memory maps, delete this window's chunk files, then purge the hub-cache copy.
+
+        The purge runs here, at the window boundary. The next window has not loaded yet, so
+        nothing is reading the cache. Chunks are re-downloaded for the next window as needed.
+        """
         self.payloads = []
         gc.collect()
         for path in self.paths:
@@ -286,6 +319,7 @@ class Window:
             except FileNotFoundError:
                 pass
         self.paths = []
+        purge_hub_cache_for_repo(self.cache_repo, repo_type="dataset")
 
 
 class ReplayBuffer:
