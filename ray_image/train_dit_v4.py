@@ -273,7 +273,8 @@ def purge_hub_cache_for_repo(repo_id: str, repo_type: str = "dataset") -> int:
 class Window:
     """The chunks of one training window, loaded for sampling."""
 
-    def __init__(self, index: int, chunk_indices, cache_dir: Path, cache_repo: str):
+    def __init__(self, index: int, chunk_indices, cache_dir: Path, cache_repo):
+        """cache_repo is either one repo id (str) or a callable chunk_id -> repo id."""
         self.index = index
         self.chunk_indices = list(chunk_indices)
         self.cache_dir = cache_dir
@@ -284,9 +285,12 @@ class Window:
         self.count = 0
         self.text_len = None
 
+    def repo_for(self, index: int) -> str:
+        return self.cache_repo(index) if callable(self.cache_repo) else self.cache_repo
+
     def load(self) -> None:
         for idx in self.chunk_indices:
-            path = fetch_chunk(self.cache_dir, self.cache_repo, idx)
+            path = fetch_chunk(self.cache_dir, self.repo_for(idx), idx)
             self.payloads.append(load_chunk_payload(path))
             self.paths.append(path)
         text_lens = {int(p["text_emb"].shape[1]) for p in self.payloads}
@@ -319,7 +323,8 @@ class Window:
             except FileNotFoundError:
                 pass
         self.paths = []
-        purge_hub_cache_for_repo(self.cache_repo, repo_type="dataset")
+        for repo_id in sorted({self.repo_for(idx) for idx in self.chunk_indices}):
+            purge_hub_cache_for_repo(repo_id, repo_type="dataset")
 
 
 class ReplayBuffer:

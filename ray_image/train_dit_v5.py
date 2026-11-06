@@ -15,6 +15,7 @@ Checkpoint files are written as a pair, as in v4:
 
 import argparse
 import copy
+import functools
 import math
 import os
 import re
@@ -47,7 +48,6 @@ from .dit_v5_moe import (
     warm_start_from_v4,
 )
 from .train_dit_v4 import (
-    CACHE_DEFAULT_REPO,
     CHECKPOINT_EVERY,
     DISK_REFUSE_SAVE_PCT,
     GRAD_CLIP,
@@ -72,7 +72,6 @@ from .train_dit_v4 import (
     checkpoint_has_corruption,
     load_vae,
     log_disk_usage,
-    make_windows,
     sample_training_batch,
     seed_everything,
     set_learning_rate,
@@ -80,6 +79,10 @@ from .train_dit_v4 import (
 
 HF_DEFAULT_REPO_V5 = "Rishix500/ray-image-dit-v5-moe"
 MILESTONE_DEFAULT_REPO_V5 = "Rishix500/ray-image-dit-v5-moe-milestones"
+# Multi-repo cache (see repo_for_chunk). 500k samples = 50 chunks of 10k.
+CACHE_DEFAULT_REPOS = "Rishix500/monet-qwen-cache-200k-v4,Rishix500/mixed-qwen-cache-250k-v5"
+CHUNKS_PER_REPO_DEFAULT = 25
+TOTAL_CHUNKS_DEFAULT = 50
 CKPT_PREFIX = "ray_dit_v5_step_"
 EMA_CKPT_PREFIX = "ray_dit_v5_ema_step_"
 CKPT_PREFIXES = (CKPT_PREFIX, EMA_CKPT_PREFIX)
@@ -145,7 +148,9 @@ def build_config(args) -> dict:
         # RB-03: provenance so a later run (or generate.py) can tell exactly what this was trained on.
         "latent_space": LATENT_SPACE,
         "vae_checkpoint": VAE_CHECKPOINT,
-        "cache_repo": args.cache_repo,
+        "cache_repos": parse_cache_repos(args.cache_repos),
+        "chunks_per_repo": args.chunks_per_repo,
+        "total_chunks": args.total_chunks,
         "cache_window": args.cache_window,
         "replay_buffer": args.replay_buffer,
         "caption_drop": CAPTION_DROP,
@@ -362,11 +367,47 @@ def load_warm_start(path: Path, dit, ema, warmup_steps: int) -> int:
     return int(step)
 
 
-def open_window(index: int, chunk_indices, cache_dir: Path, cache_repo: str):
+def parse_cache_repos(text: str) -> list:
+    """Parse --cache-repos ("org/a,org/b"). Empty entries are ignored. Each entry must be org/name."""
+    repos = [item.strip() for item in text.split(",") if item.strip()]
+    if not repos:
+        raise ValueError("--cache-repos must name at least one Hugging Face dataset repo")
+    for repo in repos:
+        parts = repo.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(f"--cache-repos entry {repo!r} must have the form org/name")
+    return repos
+
+
+def repo_for_chunk(chunk_id: int, repos, chunks_per_repo: int) -> str:
+    """Return the repo that holds chunk_id: repos[chunk_id // chunks_per_repo].
+
+    With the defaults (25 chunks per repo, two repos) chunks 0-24 come from repo 0 and
+    chunks 25-49 from repo 1. A chunk past the last repo raises ValueError.
+    """
+    if chunk_id < 0:
+        raise ValueError(f"chunk id must be >= 0, got {chunk_id}")
+    if chunks_per_repo < 1:
+        raise ValueError(f"--chunks-per-repo must be >= 1, got {chunks_per_repo}")
+    if not repos:
+        raise ValueError("no cache repos given")
+    repo_index = chunk_id // chunks_per_repo
+    if repo_index >= len(repos):
+        raise ValueError(f"Requested chunk {chunk_id}, but only {len(repos)} repos provided.")
+    return repos[repo_index]
+
+
+def make_windows_v5(total_chunks: int, cache_window: int):
+    """Consecutive groups of cache_window chunks, covering chunks 0..total_chunks-1."""
+    indices = list(range(total_chunks))
+    return [indices[i:i + cache_window] for i in range(0, len(indices), cache_window)]
+
+
+def open_window(index: int, chunk_indices, cache_dir: Path, cache_repo):
     """The only place training data is opened. The trainer uses the returned object through
     load(), sample_training_batch(), replay.absorb() and release(). To change the data format
     (for example WebDataset or Parquet streaming), replace this function and keep that interface."""
-    return Window(index, chunk_indices, cache_dir, cache_repo)
+    return Window(index, chunk_indices, cache_dir, cache_repo)  # cache_repo: callable chunk_id -> repo
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +421,12 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=TRAIN_LR)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cache-path", type=str, required=True)
-    parser.add_argument("--cache-repo", type=str, default=CACHE_DEFAULT_REPO)
+    parser.add_argument("--cache-repos", type=str, default=CACHE_DEFAULT_REPOS,
+                        help="Comma-separated Hugging Face dataset repos, in chunk order.")
+    parser.add_argument("--chunks-per-repo", type=int, default=CHUNKS_PER_REPO_DEFAULT,
+                        help="Chunks held by each repo before switching to the next. The last repo takes the rest.")
+    parser.add_argument("--total-chunks", type=int, default=TOTAL_CHUNKS_DEFAULT,
+                        help="Number of 10k-sample chunks to train over (50 = 500k samples).")
     parser.add_argument("--cache-window", type=int, default=2)
     parser.add_argument("--replay-buffer", type=int, default=5000)
     parser.add_argument("--vae-repo", type=str, default=VAE_DEFAULT_REPO)
@@ -423,11 +469,24 @@ def main():
         raise ValueError("--aux-loss-weight and --z-loss-weight must be >= 0")
     if args.resume and args.warm_start_from:
         raise ValueError("use either --resume (v5 checkpoint) or --warm-start-from (v4 checkpoint), not both")
-    windows = make_windows(args.cache_window)
+    repos = parse_cache_repos(args.cache_repos)
+    if args.total_chunks < 1:
+        raise ValueError("--total-chunks must be >= 1")
+    windows = make_windows_v5(args.total_chunks, args.cache_window)
     needed = math.ceil(args.steps / WINDOW_STEPS)
     if needed > len(windows):
         raise ValueError(f"--steps {args.steps} needs {needed} windows of {WINDOW_STEPS} steps, "
-                         f"but --cache-window {args.cache_window} gives only {len(windows)}")
+                         f"but --cache-window {args.cache_window} with --total-chunks {args.total_chunks} "
+                         f"gives only {len(windows)}")
+    # Fail before training if any chunk needed by --steps cannot be mapped to a repo.
+    for w in range(needed):
+        for chunk_id in windows[w]:
+            repo_for_chunk(chunk_id, repos, args.chunks_per_repo)
+    for repo_index, repo in enumerate(repos):
+        first = repo_index * args.chunks_per_repo
+        last = min(first + args.chunks_per_repo, args.total_chunks) - 1
+        if first < args.total_chunks:
+            print(f"[cache] repo {repo_index}: {repo} holds chunks {first}-{last}")
     if not torch.cuda.is_available():
         raise RuntimeError("DiT v5 training requires CUDA")
 
@@ -508,7 +567,8 @@ def main():
         w = step // WINDOW_STEPS
         window_end = min((w + 1) * WINDOW_STEPS, args.steps)
         if window is None:
-            window = open_window(w, windows[w], cache_dir, args.cache_repo)
+            resolver = functools.partial(repo_for_chunk, repos=repos, chunks_per_repo=args.chunks_per_repo)
+            window = open_window(w, windows[w], cache_dir, resolver)
             window.load()
             print(f"[window {w}] steps {step + 1}..{window_end}")
         while step < window_end:
