@@ -25,6 +25,7 @@ Run as a module from the repo root:
 
 import argparse
 import os
+import re
 import string
 import shutil
 import time
@@ -51,6 +52,38 @@ LOG_EVERY = 1_000
 CACHE_FORMAT = "ray-image-v4-qwen-cache-v1"  # same tensor layout as the v4 cache
 MAX_RETRIES = 3
 RETRY_BACKOFF_S = 5.0
+
+
+# Caption sanitization (applied to every caption before the Qwen encoder).
+CAPTION_LONG_WORDS = 80        # longer than this: cut at the first sentence end
+CAPTION_MAX_WORDS = 120        # hard cap on the caption length
+CAPTION_MIN_WORDS = 4          # shorter than this: the row is dropped
+_SENTENCE_END = re.compile(r"[.!](?=\s|$)")  # "." or "!" followed by whitespace or end (so 3.5 is not a split)
+
+
+def sanitize_caption(raw_caption: str) -> str:
+    """Clean a synthetic VLM caption before encoding.
+
+    1. If the caption has more than 80 words, cut it after the first "." or "!" that ends a
+       sentence. The subject is usually in the first sentence.
+    2. Cap the result at 120 words.
+    3. Drop captions with fewer than 4 words.
+
+    Returns the cleaned caption, or "" if the row should be dropped.
+    """
+    if not isinstance(raw_caption, str):
+        return ""
+    text = " ".join(raw_caption.split())  # collapse newlines and repeated spaces
+    if len(text.split()) > CAPTION_LONG_WORDS:
+        match = _SENTENCE_END.search(text)
+        if match is not None:
+            text = text[:match.end()]
+    words = text.split()
+    if len(words) > CAPTION_MAX_WORDS:
+        text = " ".join(words[:CAPTION_MAX_WORDS])
+    if len(text.split()) < CAPTION_MIN_WORDS:
+        return ""
+    return text
 
 
 class SourceExhausted(RuntimeError):
@@ -219,6 +252,10 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
                 if caption is None:
                     skip_reasons[reason] += 1
                     continue
+            caption = sanitize_caption(caption)
+            if not caption:
+                skip_reasons["caption_dropped"] += 1
+                continue
             try:
                 images.append(preprocess_image(image))
                 captions.append(caption.strip())
