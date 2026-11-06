@@ -25,6 +25,7 @@ Run as a module from the repo root:
 
 import argparse
 import os
+import string
 import shutil
 import time
 from collections import Counter
@@ -154,9 +155,31 @@ def load_vae(device: torch.device) -> RAYVAE_v3:
     return vae
 
 
+def template_fields(template: str) -> set:
+    """Field names used by a caption template. Positional fields ({}) are rejected by validate_args."""
+    return {name for _, name, _, _ in string.Formatter().parse(template) if name is not None}
+
+
+def render_caption(row: dict, template: str):
+    """Fill a caption template from named row fields.
+
+    Returns (caption, None) on success, or (None, reason) if a field is missing or empty.
+    """
+    values = {}
+    for name in template_fields(template):
+        value = row.get(name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None, "template_missing_field"
+        values[name] = value
+    caption = template.format(**values).strip()
+    if not caption:
+        return None, "template_missing_field"
+    return caption, None
+
+
 def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: torch.device,
                 batch_size: int, image_column: str, caption_column: str, dataset_name: str,
-                start: int, end: int) -> dict:
+                start: int, end: int, caption_template=None) -> dict:
     """Encode the next n_rows source rows into a chunk payload. Raises SourceExhausted if the source ends early."""
     latents = torch.empty((n_rows, LATENT_CHANNELS, LATENT_SIZE, LATENT_SIZE), dtype=torch.float16)
     text_embs = torch.empty((n_rows, CACHE_TOKENS, TEXT_DIM), dtype=torch.float16)
@@ -183,13 +206,19 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
                 skip_reasons["source_error"] += 1
                 continue
             image = sample.get(image_column)
-            caption = sample.get(caption_column)
             if image is None:
                 skip_reasons["no_image"] += 1
                 continue
-            if not isinstance(caption, str) or not caption.strip():
-                skip_reasons["empty_caption"] += 1
-                continue
+            if caption_template is None:
+                caption = sample.get(caption_column)
+                if not isinstance(caption, str) or not caption.strip():
+                    skip_reasons["empty_caption"] += 1
+                    continue
+            else:
+                caption, reason = render_caption(sample, caption_template)
+                if caption is None:
+                    skip_reasons[reason] += 1
+                    continue
             try:
                 images.append(preprocess_image(image))
                 captions.append(caption.strip())
@@ -335,6 +364,13 @@ def upload_chunk(path: Path, api: HfApi, repo_id: str) -> None:
 
 
 def validate_args(args) -> None:
+    if args.caption_template is not None:
+        try:
+            names = [name for _, name, _, _ in string.Formatter().parse(args.caption_template) if name is not None]
+        except ValueError as exc:
+            raise ValueError(f"--caption-template is not a valid format string: {exc}")
+        if not names or any(name == "" for name in names):
+            raise ValueError("--caption-template must use named fields, e.g. 'a painting by {artist}, {style}'")
     if args.source_offset < 0:
         raise ValueError("--source-offset must be >= 0")
     if args.start_chunk * args.chunk_size < args.source_offset:
@@ -364,6 +400,9 @@ def main() -> None:
     parser.add_argument("--dataset-config", type=str, default=None, help="dataset config name, if it has one")
     parser.add_argument("--image-split", type=str, default="train")
     parser.add_argument("--image-column", type=str, default="image")
+    parser.add_argument("--caption-template", type=str, default=None,
+                        help="Build the caption from row fields, e.g. 'a painting by {artist}, {style}'. "
+                             "Overrides --caption-column. Rows with a missing field are skipped.")
     parser.add_argument("--caption-column", type=str, default="caption",
                         help="column with the caption text. Rows without one are skipped.")
     parser.add_argument("--start-chunk", type=int, required=True)
@@ -438,7 +477,8 @@ def main() -> None:
             print(f"[build] chunk {index}: source rows {start}:{end}")
             try:
                 payload = build_chunk(source, args.chunk_size, vae, text_encoder, device, args.batch_size,
-                                      args.image_column, args.caption_column, args.dataset_name, start, end)
+                                      args.image_column, args.caption_column, args.dataset_name, start, end,
+                                      caption_template=args.caption_template)
             except SourceExhausted as exc:
                 print(f"[stop] chunk {index} not written: {exc}. Earlier chunks are complete.")
                 raise SystemExit(1)
