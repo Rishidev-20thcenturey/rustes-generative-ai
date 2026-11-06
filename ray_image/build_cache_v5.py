@@ -166,6 +166,7 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
     skip_reasons = Counter()
     retries_before = source.retries
     skipped_before = source.skipped_rows
+    source_row_start = source.position
 
     while seen < n_rows:
         images = []
@@ -247,6 +248,8 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
         "source": dataset_name,
         "source_start": start,
         "source_end": end,
+        "source_row_start": source_row_start,
+        "source_row_end": source_row_start + seen,
         "samples_seen": seen,
         "samples_cached": cached,
         "samples_skipped": sum(skip_reasons.values()),
@@ -332,6 +335,14 @@ def upload_chunk(path: Path, api: HfApi, repo_id: str) -> None:
 
 
 def validate_args(args) -> None:
+    if args.source_offset < 0:
+        raise ValueError("--source-offset must be >= 0")
+    if args.start_chunk * args.chunk_size < args.source_offset:
+        raise ValueError(
+            f"--start-chunk {args.start_chunk} starts at global row {args.start_chunk * args.chunk_size}, "
+            f"which is before --source-offset {args.source_offset}; start at chunk "
+            f"{-(-args.source_offset // args.chunk_size)} or later"
+        )
     if not args.dataset_name.strip():
         raise ValueError("--dataset-name is required")
     if args.start_chunk < 0 or args.end_chunk <= args.start_chunk:
@@ -357,6 +368,9 @@ def main() -> None:
                         help="column with the caption text. Rows without one are skipped.")
     parser.add_argument("--start-chunk", type=int, required=True)
     parser.add_argument("--end-chunk", type=int, required=True, help="exclusive")
+    parser.add_argument("--source-offset", type=int, default=0,
+                        help="Global row where this dataset begins. Chunk c reads dataset row "
+                             "c*chunk_size - source_offset. Lets several datasets fill one chunk space.")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--hf-repo", type=str, default=None, help="output dataset repo, e.g. Rishix500/mixed-qwen-cache-250k-v5")
     parser.add_argument("--no-hf-upload", action="store_true", help="build locally only; nothing is uploaded or deleted")
@@ -394,10 +408,13 @@ def main() -> None:
         return load_dataset(args.dataset_name, args.dataset_config, split=args.image_split,
                             streaming=True).skip(position)
 
-    source = SafeIterator(open_at, start=args.start_chunk * args.chunk_size)
+    offset = args.source_offset
+    source = SafeIterator(open_at, start=args.start_chunk * args.chunk_size - offset)
     print(f"[window] dataset={args.dataset_name}:{args.image_split} chunks {args.start_chunk}.."
-          f"{args.end_chunk - 1} (source rows {args.start_chunk * args.chunk_size:,}.."
-          f"{args.end_chunk * args.chunk_size:,})")
+          f"{args.end_chunk - 1} (global rows {args.start_chunk * args.chunk_size:,}.."
+          f"{args.end_chunk * args.chunk_size:,}; dataset rows "
+          f"{args.start_chunk * args.chunk_size - offset:,}..{args.end_chunk * args.chunk_size - offset:,}; "
+          f"source-offset {offset:,})")
 
     completed = 0
     for index in range(args.start_chunk, args.end_chunk):
@@ -405,13 +422,13 @@ def main() -> None:
         end = start + args.chunk_size
         filename = chunk_filename(start, end)
         local_path = output_dir / filename
-        source.skip_to(start)
+        source.skip_to(start - offset)
 
         if filename in existing_hf and not args.no_hf_upload:
             print(f"[resume] HF already has {filename}; skipping chunk {index}")
             if local_path.exists():
                 local_path.unlink()
-            source.skip_to(end)
+            source.skip_to(end - offset)
             completed += 1
             continue
 
