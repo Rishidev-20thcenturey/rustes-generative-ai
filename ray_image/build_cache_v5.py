@@ -14,9 +14,9 @@ Behaviour:
 - Atomic writes: a chunk is written to *.pt.partial and renamed to *.pt only when complete.
 - Resume: a chunk already in --hf-repo is skipped. A complete local chunk is uploaded without
   re-encoding. Only the source rows are skipped.
-- Disk auto-purge: after a chunk is uploaded, its local .pt is deleted and the Hugging Face hub
-  cache is cleared (including *.incomplete files). The VAE and Qwen weights are re-downloaded on the
-  next start. Without an upload (--no-hf-upload) nothing is deleted.
+- Disk auto-purge: after a chunk is uploaded, its local .pt is deleted, the output repo's dataset
+  cache (datasets--<org>--*) is removed, and *.incomplete files are deleted. The models--* folders
+  (Qwen, VAE) are kept, so they are not re-downloaded. Without an upload (--no-hf-upload) nothing is deleted.
 
 Run as a module from the repo root:
   python -m ray_image.build_cache_v5 --dataset-name huggan/wikiart --image-split train \\
@@ -56,7 +56,7 @@ RETRY_BACKOFF_S = 5.0
 
 # Caption sanitization (applied to every caption before the Qwen encoder).
 CAPTION_LONG_WORDS = 80        # longer than this: cut at the first sentence end
-CAPTION_MAX_WORDS = 120        # hard cap on the caption length
+CAPTION_MAX_WORDS = 90         # hard cap on the caption length (~117 tokens at 1.3 tokens/word)
 CAPTION_MIN_WORDS = 4          # shorter than this: the row is dropped
 _SENTENCE_END = re.compile(r"[.!](?=\s|$)")  # "." or "!" followed by whitespace or end (so 3.5 is not a split)
 
@@ -66,7 +66,7 @@ def sanitize_caption(raw_caption: str) -> str:
 
     1. If the caption has more than 80 words, cut it after the first "." or "!" that ends a
        sentence. The subject is usually in the first sentence.
-    2. Cap the result at 120 words.
+    2. Cap the result at 90 words.
     3. Drop captions with fewer than 4 words.
 
     Returns the cleaned caption, or "" if the row should be dropped.
@@ -364,20 +364,35 @@ def chunk_is_complete(path: Path, chunk_size: int) -> bool:
     return ok
 
 
-def purge_hf_hub_cache(log=print) -> int:
-    """Delete the Hugging Face hub cache (HF_HUB_CACHE, default ~/.cache/huggingface/hub).
+def purge_hf_hub_cache(owner: str, log=print) -> int:
+    """Delete this run's dataset cache from the Hugging Face hub cache. Model caches are kept.
 
-    This removes the .incomplete download files as well. Returns the bytes freed.
+    Removes every <HF_HUB_CACHE>/datasets--<owner>--* folder and every *.incomplete file under the
+    hub cache. models--* folders (Qwen, VAE) are never touched, so they are not re-downloaded.
+    Returns the bytes freed.
     """
+    if not owner or "/" in owner:
+        raise ValueError(f"purge owner must be a bare org name, got {owner!r}")
     root = Path(constants.HF_HUB_CACHE).expanduser()
     if not root.exists():
         return 0
     if root.name != "hub" or root.is_symlink():
         log(f"[purge] refusing to purge unexpected path {root}")
         return 0
-    freed = sum(f.stat().st_size for f in root.rglob("*") if f.is_file() and not f.is_symlink())
-    shutil.rmtree(root)
-    log(f"[purge] cleared {root} ({freed / (1024 ** 3):.2f} GB, including .incomplete files)")
+    freed = 0
+    prefix = f"datasets--{owner}--"
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and not child.is_symlink() and child.name.startswith(prefix):
+            size = sum(f.stat().st_size for f in child.rglob("*") if f.is_file() and not f.is_symlink())
+            shutil.rmtree(child)
+            freed += size
+            log(f"[purge] deleted {child.name} ({size / (1024 ** 3):.2f} GB)")
+    for part in root.rglob("*.incomplete"):
+        if part.is_file() and not part.is_symlink():
+            freed += part.stat().st_size
+            part.unlink()
+            log(f"[purge] deleted partial download {part.name}")
+    log(f"[purge] kept model caches (models--*); freed {freed / (1024 ** 3):.2f} GB")
     return freed
 
 
@@ -530,7 +545,7 @@ def main() -> None:
             existing_hf.add(filename)
             local_path.unlink()
             print(f"[purge] deleted local {filename}")
-            purge_hf_hub_cache()
+            purge_hf_hub_cache(owner=args.hf_repo.split("/")[0])
         completed += 1
 
     print(f"[done] completed {completed}/{args.end_chunk - args.start_chunk} chunks; "
