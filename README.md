@@ -185,7 +185,7 @@ The diagram describes the intended v3 generation route. A checkpoint, VAE, laten
 | Data source | MONET (jasperai/monet) or precomputed cache |
 | Cached text shape | Dataset card describes 47 × 2,560 text embeddings per cached item |
 
-These values define the recorded v3 training recipe. Exact reproduction also depends on the specific dependency versions, GPU environment, dataset ranges, and checkpoint used for a run.
+These values define the v3 training recipe. Reproducing a run requires matching the dependency versions, GPU environment, dataset ranges, and checkpoint.
 
 ## 🧱 Engineering timeline
 
@@ -250,17 +250,17 @@ These safeguards improve diagnosis and reduce avoidable incompatibility. They do
 | **Credentials and ephemeral sessions** | Environment variables do not survive fresh hosted sessions, and credentials should not be written into source or logs | Load secrets from environment variables at session start; never commit tokens or print them |
 | **Ambiguous checkpoints** | A weight file without stage/config provenance can be loaded through the wrong architecture | Store metadata, validate resume configuration and retain separate names for full and EMA checkpoints |
 
-## 📊 What the legacy v3 results mean — and do not mean
+## 📊 What the v3 baseline established
 
-### What has been achieved
+### Engineering achievements
 
 - A custom VAE v2 and a larger latent representation for the 256 × 256 image-generation path.
-- A custom, text-conditioned DiT v3 architecture with a reported size of roughly 60M parameters.
+- A custom, text-conditioned DiT v3 architecture with approximately 60M parameters.
 - A cached data route for VAE latents and Qwen text embeddings.
 - Training code with flow matching, caption dropout, null-prompt handling, EMA, gradient clipping and numerical guards.
 - A generation entry point with optional CFG and EMA loading for compatible v3 checkpoints.
 - Checkpoint provenance/resume checks, latent-whitening validation and CPU smoke modules wired into GitHub Actions.
-- A reported 300,000-step training milestone and a ten-prompt gallery showing real experimental outputs.
+- A completed 300,000-step training milestone and a ten-prompt gallery of generated outputs.
 
 ### Current evaluation priorities
 
