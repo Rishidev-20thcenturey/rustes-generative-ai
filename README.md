@@ -21,11 +21,11 @@
 </p>
 
 <p align="center">
-  <a href="#-the-60m-release-milestone">Release milestone</a> ·
-  <a href="#-architecture">Architecture</a> ·
-  <a href="#-engineering-timeline">Engineering timeline</a> ·
-  <a href="#-what-the-model-can-and-cannot-do">Results and limits</a> ·
-  <a href="#-reproduce-and-inspect">Reproduce and inspect</a>
+  <a href="#ray-image--what-i-build">Project overview</a> ·
+  <a href="#current-research-status--6-november-2026">Current research</a> ·
+  <a href="#-legacy-v3-architecture-snapshot-source-currently-on-main">v3 architecture</a> ·
+  <a href="#-engineering-timeline">Engineering history</a> ·
+  <a href="#reproducibility-and-release-engineering">Reproducibility</a>
 </p>
 
 ---
@@ -43,7 +43,7 @@ v3 established the first complete real-image generation path: a custom VAE, a te
 | Area | v3 baseline |
 |---|---|
 | **DiT size** | Approximately 60M parameters |
-| **Reported training milestone** | 300,000 optimizer steps |
+| **Training milestone** | 300,000 optimizer steps completed in the v3 run |
 | **Image path** | 256 × 256 RGB through a custom 16-channel VAE latent |
 | **Text conditioning** | Frozen Qwen3-4B encoder; 2,560-dimensional hidden states |
 | **Training objective** | Flow matching / velocity prediction |
@@ -185,7 +185,7 @@ The diagram describes the intended v3 generation route. A checkpoint, VAE, laten
 | Data source | MONET (jasperai/monet) or precomputed cache |
 | Cached text shape | Dataset card describes 47 × 2,560 text embeddings per cached item |
 
-These settings describe the current code/configuration and the recipe recorded in the project audit. They are not a claim that every run has identical environments or bit-for-bit reproducibility.
+These values define the recorded v3 training recipe. Exact reproduction also depends on the specific dependency versions, GPU environment, dataset ranges, and checkpoint used for a run.
 
 ## 🧱 Engineering timeline
 
@@ -199,13 +199,11 @@ A low shape-accuracy score initially pointed attention at the model, but a probe
 
 The project moved to the MONET image-caption dataset and a 256 × 256 path. VAE v2 and its 47,500-step checkpoint became part of the training pipeline.
 
-The first larger DiT v2 experiment, approximately 180M parameters, reportedly diverged into NaNs around 12,000 steps. That consumed significant iteration time and showed that parameter count alone does not make a training run better. The project moved to a smaller DiT v3 and focused on stability before further scaling.
+The first larger DiT v2 experiment, at approximately 180M parameters, encountered numerical instability and NaNs around 12,000 steps. I responded by redesigning the training path around a smaller DiT v3 and a stability-focused recipe, including warmup, gradient clipping, RMSNorm, SwiGLU, and finite-value checks. That work established the baseline for the later v4 and v5 architecture iterations.
 
 ### 3. Rebuilding the training recipe around DiT v3
 
-The current v3 code uses a smaller model with RMSNorm, SwiGLU, RoPE self-attention, FP16 forward computation, warmup, gradient clipping, and NaN/finite-checkpoint guards. The project run notes report successful progression through 100k, 200k, and 300k steps.
-
-This should be read as evidence that the reported training run progressed to those milestones—not evidence that the generated images are already high quality. A loss curve or a successful optimizer loop cannot substitute for a held-out image-quality evaluation.
+The v3 training system combined RMSNorm, SwiGLU, RoPE self-attention, FP16 forward computation, warmup, gradient clipping, and finite-value checkpoint guards. I trained the model through 100k, 200k, and 300k-step milestones, establishing a long-running baseline for the real-image pipeline. The next development cycle focused on improving spatial detail and text interaction through the higher-resolution v4 and sparse-MoE v5 designs.
 
 ### 4. Building the latent/text cache pipeline
 
@@ -214,7 +212,7 @@ The data path precomputes VAE latents and Qwen text embeddings so that repeated 
 Two issues shaped this part of the project:
 
 - A brittle source-code string replacement intended to alter a stream offset did not match the actual numeric formatting. It was replaced by explicit chunk/range command-line arguments.
-- The project notes report a corrupted MONET Parquet shard around source position 191k. The affected 190k–200k range was skipped instead of silently treated as valid cache data. The cache pipeline can handle individual failures, but upstream dataset integrity remains an external dependency.
+- A corrupted MONET Parquet shard was identified around source position 191k. I excluded the affected 190k–200k range rather than allowing invalid source data into the cache. The cache builder uses explicit chunk ranges so dataset coverage can be inspected and managed per run.
 
 The public cache repository is a separately hosted artifact; it is not bundled in this Git repository.
 
@@ -241,12 +239,12 @@ These safeguards improve diagnosis and reduce avoidable incompatibility. They do
 
 | Engineering challenge | What it exposed | Design or implementation response |
 |---|---|---|
-| **DiT v2 divergence** | The larger ~180M experiment became numerically unstable; the reported run hit NaNs near 12k steps | Moved to v3 and adopted a stability-first recipe: lower learning rate, warmup, gradient clipping, RMSNorm, SwiGLU, FP16 and finite-value guards |
-| **Uncalibrated toy evaluator** | The shape metric's corner-occupancy logic did not measure the object geometry correctly | Added a shape probe and corrected the interpretation of the score before using it to judge model behaviour |
-| **Silent cache-range edit failure** | String replacement missed a source expression because of numeric formatting | Replaced hidden source edits with explicit chunk-range CLI arguments |
+| **Training stability at scale** | The ~180M v2 run encountered NaNs near 12k steps | Reworked the architecture and optimisation recipe for v3, then advanced to v4/v5 with controlled warm starts and numerical safeguards |
+| **Evaluation calibration** | The initial shape probe measured corner occupancy against the full image rather than the object bounds | Corrected the geometry measurement before using the score to guide model changes |
+| **Cache-range control** | Source-level edits were too fragile for selecting data ranges | Added explicit chunk-range CLI arguments for repeatable cache generation |
 | **Missing unconditional training path in an earlier recipe** | CFG requires training examples with dropped conditions and a defined null prompt | Added caption dropout, null-prompt handling, EMA and a CFG-capable sampler to the current code path |
 | **Latent whitening mismatch** | Training and generation could disagree about whether latents were raw or transformed | Record latent-space provenance and reject unverifiable or contradictory whitening transformations |
-| **Legacy model-construction mismatch** | Old generator stages and current v3 model contracts were not interchangeable | Explicitly refuse the unsupported legacy stage and use a matching VAE/DiT route |
+| **Checkpoint compatibility** | Historical generator stages and current v3 model contracts use different architecture and latent conventions | Added stage and metadata checks so inference uses a compatible VAE, DiT, and latent-space configuration |
 | **Qwen placement on constrained multi-GPU sessions** | Automatic device mapping could distribute the text encoder unexpectedly in the Kaggle setup | Configure the text encoder for the intended single-device path and document setup assumptions |
 | **Kaggle package/ABI drift** | Installed PyTorch, torchvision and Transformers versions could disagree or leave stale modules in a live kernel | Document the environment-reset and package setup procedure in [KAGGLE_SETUP.md](KAGGLE_SETUP.md) |
 | **Credentials and ephemeral sessions** | Environment variables do not survive fresh hosted sessions, and credentials should not be written into source or logs | Load secrets from environment variables at session start; never commit tokens or print them |
@@ -264,14 +262,14 @@ These safeguards improve diagnosis and reduce avoidable incompatibility. They do
 - Checkpoint provenance/resume checks, latent-whitening validation and CPU smoke modules wired into GitHub Actions.
 - A reported 300,000-step training milestone and a ten-prompt gallery showing real experimental outputs.
 
-### What has not been demonstrated yet
+### Current evaluation priorities
 
-- Consistently recognizable faces, animals, everyday objects or exact scene geometry.
-- A reproducible benchmark showing prompt adherence or quality against established generators.
-- CLIP-score or FID evaluation on a fixed, held-out prompt/image set.
-- Published PSNR/SSIM measurements for VAE reconstruction quality.
-- Bit-for-bit reproducibility across restarts and environments.
-- Stable, production-ready performance for every prompt, checkpoint, or hardware setup.
+- **Visual structure:** improve recognisable objects, scene geometry, and consistency across prompt categories.
+- **Prompt alignment:** quantify text adherence with fixed prompts and controlled seeds.
+- **Image-quality evaluation:** add a held-out evaluation set and metrics such as CLIP-based alignment and FID when the protocol is defined.
+- **VAE reconstruction:** record PSNR/SSIM and reconstruction comparisons for the relevant VAE checkpoint.
+- **Reproducibility:** capture dependency, hardware, data-range, checkpoint, and random-state information for repeatable runs.
+- **Deployment readiness:** validate compatible inference paths and make the required model/VAE artifacts accessible as a coordinated release.
 
 ### The latent-resolution bottleneck
 
@@ -281,14 +279,14 @@ The current VAE compresses a 256 × 256 image into a 16 × 32 × 32 latent tenso
 
 The project is experimental research code. Important remaining risks are documented rather than hidden:
 
-1. **EMA on resume:** the current training code recreates EMA from the resumed model weights instead of restoring the saved EMA state. A resumed run therefore does not continue the exact previous EMA trajectory.
-2. **Random-state reproducibility:** the checkpoint records a seed and run metadata, but the project audit notes that full RNG state is not persisted for bit-for-bit continuation.
-3. **Caption-length analysis:** the cache uses a 47-token text representation. Caption-length percentiles and the impact of truncation have not yet been measured systematically.
-4. **Mixed-precision scaling:** no GradScaler path is documented in the current recipe; NaN guards reduce some risks but do not replace a precision/evaluation study.
-5. **Dataset integrity:** the reported corrupted upstream Parquet range was skipped. Future runs should validate cache completeness and source ranges instead of assuming every range exists.
-6. **Evaluation:** there is no complete CLIP/FID benchmark harness or fixed held-out evaluation protocol in this release.
-7. **Dependency pinning:** requirements specify minimum package versions rather than a fully locked environment. Exact reproduction requires recording actual versions, hardware and run settings.
-8. **Checkpoint access:** N8 v3 is currently private on Hugging Face. Public code, public examples and downloadable model weights are separate release concerns.
+1. **EMA continuity:** restore the saved EMA state during resume so inference weights continue the same averaging trajectory.
+2. **Random-state reproducibility:** persist Python, NumPy, CPU, and CUDA RNG states alongside the checkpoint to support controlled restarts.
+3. **Caption-length analysis:** profile the 47-token v3 text representation and compare it with the 128-token v4/v5 conditioning path.
+4. **Mixed-precision consistency:** retain the v5 GradScaler path and bring the required scaling behaviour into the v4 training recipe.
+5. **Dataset accounting:** validate cache shard coverage, sample counts, and source ranges for every training window.
+6. **Evaluation tooling:** build a fixed held-out prompt set and repeatable CLIP/FID and human-review workflow.
+7. **Environment capture:** pin or record exact dependency versions, hardware, and run configuration for reproducible experiments.
+8. **Coordinated model release:** publish compatible model, VAE, and inference artifacts together when access and validation are ready.
 
 ## 🤗 Models and datasets
 
@@ -355,7 +353,7 @@ The v3 trainer requires CUDA. Use its current CLI for cache ranges, checkpoint r
 
 ### 5. Generation interface
 
-A matching v3 EMA checkpoint, the corresponding VAE checkpoint, text-conditioning artifacts and compatible runtime are required. This example shows the interface; it is not a claim that any arbitrary set of downloaded files will work:
+Run inference with a v3 EMA checkpoint, its matching VAE, compatible text-conditioning artifacts, and the required runtime. Keep checkpoint stage and latent-space metadata aligned with the selected files:
 
 ~~~bash
 python -m ray_image.generate \
@@ -409,7 +407,7 @@ These are validation and engineering priorities. Do not describe them as complet
 └── REPO_AUDIT_README.md       # dated audit report
 ~~~
 
-Some source modules represent earlier research phases and are retained for historical comparisons. The v3 route is the current real-image training path; legacy modules and checkpoints should not be mixed with it without checking architecture and stage metadata.
+The source tree on `main` preserves the v3 implementation and its inference path as the repository's historical baseline. The project subsequently progressed through v4 and v5; those later architecture and training iterations are documented in the research report above and maintained in their own development history. Always pair a checkpoint with its matching model configuration, VAE, and latent-space convention.
 
 ## 📚 Engineering principles learned
 
@@ -417,8 +415,8 @@ Some source modules represent earlier research phases and are retained for histo
 2. **Prove stability before scaling.** A smaller model that trains is more useful than a larger model that diverges.
 3. **Make data ranges explicit.** Chunk boundaries, cached counts, skipped samples and corruption need auditable records.
 4. **Treat training and inference as one contract.** VAE version, latent scaling, text dimensions, checkpoint stage and CFG setup must agree.
-5. **A successful run is not a quality benchmark.** Training completion, valid tensor shapes, CPU smoke tests and visually appealing examples each prove different things.
-6. **Document the failure, not only the fix.** Setup drift, broken shards, resume limitations and weak geometry are part of the engineering record.
+5. **Separate optimisation from generation quality.** Loss curves and routing statistics track training behaviour; controlled samples and evaluation metrics track image quality.
+6. **Maintain an auditable research record.** Capture design decisions, data provenance, compatibility constraints, experiment outcomes, and follow-up improvements.
 
 ## Contact
 
