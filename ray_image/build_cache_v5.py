@@ -14,9 +14,9 @@ Behaviour:
 - Atomic writes: a chunk is written to *.pt.partial and renamed to *.pt only when complete.
 - Resume: a chunk already in --hf-repo is skipped. A complete local chunk is uploaded without
   re-encoding. Only the source rows are skipped.
-- Disk auto-purge: after a chunk is uploaded, its local .pt is deleted, the output repo's dataset
-  cache (datasets--<org>--*) is removed, and *.incomplete files are deleted. The models--* folders
-  (Qwen, VAE) are kept, so they are not re-downloaded. Without an upload (--no-hf-upload) nothing is deleted.
+- Disk auto-purge: after a chunk is uploaded, its local .pt is deleted, all dataset caches
+  (datasets--*) are removed, and *.incomplete files are deleted. The models--* folders (Qwen, VAE)
+  are kept, so they are not re-downloaded. Without an upload (--no-hf-upload) nothing is deleted.
 
 Run as a module from the repo root:
   python -m ray_image.build_cache_v5 --dataset-name huggan/wikiart --image-split train \\
@@ -364,15 +364,13 @@ def chunk_is_complete(path: Path, chunk_size: int) -> bool:
     return ok
 
 
-def purge_hf_hub_cache(owner: str, log=print) -> int:
-    """Delete this run's dataset cache from the Hugging Face hub cache. Model caches are kept.
+def purge_hf_hub_cache(log=print) -> int:
+    """Delete all dataset caches from the Hugging Face hub cache. Model caches are kept.
 
-    Removes every <HF_HUB_CACHE>/datasets--<owner>--* folder and every *.incomplete file under the
-    hub cache. models--* folders (Qwen, VAE) are never touched, so they are not re-downloaded.
+    Removes every <HF_HUB_CACHE>/datasets--* folder and every *.incomplete file under the hub
+    cache. models--* folders (Qwen, VAE) are never touched, so they are not re-downloaded.
     Returns the bytes freed.
     """
-    if not owner or "/" in owner:
-        raise ValueError(f"purge owner must be a bare org name, got {owner!r}")
     root = Path(constants.HF_HUB_CACHE).expanduser()
     if not root.exists():
         return 0
@@ -380,9 +378,8 @@ def purge_hf_hub_cache(owner: str, log=print) -> int:
         log(f"[purge] refusing to purge unexpected path {root}")
         return 0
     freed = 0
-    prefix = f"datasets--{owner}--"
     for child in sorted(root.iterdir()):
-        if child.is_dir() and not child.is_symlink() and child.name.startswith(prefix):
+        if child.is_dir() and not child.is_symlink() and child.name.startswith("datasets--"):
             size = sum(f.stat().st_size for f in child.rglob("*") if f.is_file() and not f.is_symlink())
             shutil.rmtree(child)
             freed += size
@@ -545,7 +542,7 @@ def main() -> None:
             existing_hf.add(filename)
             local_path.unlink()
             print(f"[purge] deleted local {filename}")
-            purge_hf_hub_cache(owner=args.hf_repo.split("/")[0])
+            purge_hf_hub_cache()
         completed += 1
 
     print(f"[done] completed {completed}/{args.end_chunk - args.start_chunk} chunks; "
