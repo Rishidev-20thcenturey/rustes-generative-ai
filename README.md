@@ -7,15 +7,15 @@
 <p align="center">
   <a href="https://github.com/Rishidev-20thcenturey/rustes-generative-ai/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/Rishidev-20thcenturey/rustes-generative-ai/test.yml?branch=main&label=CPU%20smoke%20checks&style=for-the-badge" alt="RAY-IMAGE GitHub Actions smoke-check status" /></a>
   <a href="https://huggingface.co/Rishix500"><img src="https://img.shields.io/badge/Hugging%20Face-Rishix500-FFD21E?style=for-the-badge&logo=huggingface&logoColor=000000" alt="RAY-IMAGE Hugging Face profile" /></a>
-  <img src="https://img.shields.io/badge/DiT-~60M%20parameters-7867D5?style=for-the-badge" alt="Approximately 60 million parameter DiT" />
-  <img src="https://img.shields.io/badge/Training%20milestone-300k%20steps-177A55?style=for-the-badge" alt="Reported 300,000 step training milestone" />
+  <img src="https://img.shields.io/badge/Research%20model-v5%20MoE%20~482M-7867D5?style=for-the-badge" alt="v5 MoE approximately 482 million total parameters" />
+  <img src="https://img.shields.io/badge/v5%20training-log-~171k%20steps-177A55?style=for-the-badge" alt="v5 training log reached approximately 171 thousand steps" />
   <img src="https://img.shields.io/badge/Stage-Experimental%20research%20release-BB7B29?style=for-the-badge" alt="Experimental research release" />
 </p>
 
 <h1 align="center">RAY-IMAGE</h1>
 
 <p align="center">
-  <strong>A from-scratch text-to-image research project — from toy latent experiments to a trained ~60M-parameter Diffusion Transformer.</strong>
+  <strong>An independent text-to-image research project spanning a legacy ~60M DiT, a 110.7M dense DiT, and an experimental ~482M sparse-MoE DiT.</strong>
   <br />
   Custom VAE · DiT v3 · Flow Matching · Qwen3-4B Text Conditioning · Classifier-Free Guidance
 </p>
@@ -30,13 +30,13 @@
 
 ---
 
-## 🔍 The 60M release milestone
+## 🔍 Legacy v3 release milestone
 
-**RAY-IMAGE is an independent attempt to build a text-to-image system from its underlying components, train it under limited compute, and document the engineering rather than hide the failures.** The project has progressed from toy-image VAE/DiT experiments to a real-image pipeline using a custom 16-channel VAE, a ~60M-parameter DiT v3, cached Qwen text embeddings, flow-matching training, and a CFG-capable sampling path.
+**RAY-IMAGE is an independent text-to-image research project built from its underlying components under constrained compute.** The v3 milestone below is a historical release snapshot: it describes the older 256 × 256 path and should not be mistaken for the later v4/v5 research configurations documented above.
 
-The project training record reports that **DiT v3 reached 300,000 optimizer steps** using a stability-focused training recipe. The current sample gallery shows genuine outputs from the project across ten text prompts. The result is a meaningful engineering milestone, but not a claim that RAY-IMAGE can yet generate consistently recognizable objects or compete with established image-generation systems.
+The project record reports that **DiT v3 reached 300,000 optimizer steps**. That remains a historical training milestone, not a claim about the current v5 run or a measure of image quality.
 
-### Release summary
+### Legacy v3 release summary
 
 | Area | Current project state |
 |---|---|
@@ -61,7 +61,78 @@ The project training record reports that **DiT v3 reached 300,000 optimizer step
 
 To describe this as a fully public model release, the intended v3 checkpoint, matching VAE, and required auxiliary artifacts must be accessible to the intended users. Checkpoints are stored outside Git because of their size. Do not assume that a public code repository means every model weight or cache is public.
 
-## 🖼️ What the current sample grid shows
+
+## Current research status — 6 November 2026
+
+> **Main-branch scope:** This section records the latest RAY-IMAGE research status. The source files currently present on `main` remain the older v3-era implementation described in the legacy sections below. This README update does **not** merge or copy v4/v5 implementation code into `main`, and it does not modify any other branch. The v4/v5 results below are project-level research notes, not runnable code supplied by this main-branch snapshot.
+
+### Model lineage
+
+| Version | Architecture | Parameters | Status |
+|---|---|---:|---|
+| **v3** | Dense DiT | ~60M | Legacy release; earlier project records report 300k steps. Checkpoint private. |
+| **v4** | Dense DiT with 2D axial RoPE, SwiGLU, and gated text cross-attention | **110,724,750 counted** | Trained. The 120k checkpoint is the warm-start source for v5. Logged loss: ~3.2 at 3k to ~2.5 at 10k. |
+| **v5** | v4 backbone with sparse MoE FFNs: 1 shared + 8 routed SwiGLU experts, top-2 routing | **~482M total; ~204M active/token (computed)** | Active training record reached ~171.4k steps. |
+
+### Shared v4/v5 configuration
+
+- **Resolution and VAE:** 512 × 512 RGB; VAE v3, 16 latent channels, 64 × 64 latent grid.
+- **Patchification:** patch size 4, producing 256 tokens; each token covers a 32 × 32 region of the output image.
+- **Text conditioning:** frozen Qwen3-4B hidden states, 2,560 dimensions, truncated to 128 tokens.
+- **Objective and sampling:** flow matching / velocity prediction; Euler integration over the learned velocity field; optional classifier-free guidance (CFG).
+
+### v5 training observations
+
+The v5 run was warm-started from the v4 120k checkpoint. The v4 FFN was copied into all nine experts, with down-projections scaled by 0.5 so the MoE output initially matches the dense FFN output. A 1,000-step learning-rate ramp was used; optimizer state and replay buffer started empty.
+
+| Signal | Logged observation | Interpretation / caveat |
+|---|---|---|
+| **Loss** | ~1.5 near 127k steps and ~1.4 near 170k; velocity MSE ~1.5 to ~1.35 | Modest improvement; no clear downward trend in the last ~40k steps. |
+| **Load balancing** | Load-balance term near 1.1 | Routing appears balanced; no expert collapse reported. |
+| **Capacity drops** | ~7% of assignments on average; ~3%–19% per logging interval | Some assignments are dropped; fully-dropped-token rate still needs direct tracking. |
+| **Router z-loss** | Fell from ~1.5 to ~0.25 | Router logits became smaller and routing softer; monitor expert specialisation. |
+| **EMA drift** | About 0.0007 | A training diagnostic, not an image-quality measure. |
+
+These are readings from training logs, not a formal benchmark or independent validation.
+
+### Sample review
+
+- **v4:** reviewed samples show more prompt-specific colour and composition than the v5 samples reviewed so far, but object structure remains weak.
+- **v5 at 135k:** a 15-prompt grid showed repeated composition patterns and weak prompt adherence. In a three-prompt run, “blue sky with white clouds” was the only clear match.
+- **v5 around 170k:** the checkpoint is recorded as present, but a matching sample grid has not yet been reviewed.
+
+**Overall:** training is progressing, but current samples do not establish reliable text-to-image generation, recognisable object structure, or production-ready quality. No FID, CLIP-score, or other formal image-quality benchmark has been run.
+
+### Open experiments and engineering risks
+
+1. **Text steering:** compare predicted velocity for the real prompt against the null prompt at identical noise and timestep. Not yet run.
+2. **170k sample comparison:** generate the same prompts and seeds used for the 135k grid.
+3. **MoE capacity:** test capacity factors such as 1.5 or 2.0 and log fully-dropped tokens, not only assignments.
+4. **v4 mixed precision:** v4 has no GradScaler; fp16 autocast can underflow small gradients. v5 does use a GradScaler.
+5. **Sampling interface:** bundled `generate.py` loads v3 only. v4/v5 use `flow.py`; a committed v4/v5 command-line sampler is not yet available.
+6. **Tests and CI:** no committed v5 smoke test exists, and current CI does not exercise the v4/v5 trainers or v5 MoE module.
+7. **Kaggle disk/cache:** cache-purge behaviour has not been fully verified; interrupted downloads can leave `.incomplete` files not removed by the documented purge.
+8. **Warm-start controls:** optimizer state starts empty at warm start. The learning-rate ramp mitigates a loss spike, but has not been compared against an unramped control.
+9. **T4 constraints:** patch size 4 means each token represents 32 × 32 output pixels. Patch size 2 would give 1,024 tokens and substantially increase attention cost.
+10. **Checkpoint footprint:** a full v5 checkpoint is about 7.7 GB and its EMA file about 1.9 GB; retaining two of each uses roughly 19 GB before cache files.
+
+### Hugging Face artifacts and visibility
+
+Visibility below was checked against Hugging Face repository metadata on **6 November 2026**. Private repository names are listed for provenance only, not as public download links.
+
+| Artifact | Repository | Access |
+|---|---|---|
+| v5 MoE main | [Rishix500/ray-image-dit-v5-moe](https://huggingface.co/Rishix500/ray-image-dit-v5-moe) | **Public**; project record reports the 170k checkpoint is present. |
+| v5 milestones | `Rishix500/ray-image-dit-v5-moe-milestones` | **Private**. |
+| v4 dense model | `Rishix500/ray-image-dit-v4-100m-512` | **Private**. |
+| v4 milestones | `Rishix500/ray-image-dit-v4-100m-512-milestones` | **Private**. |
+| VAE v3 at 512px | `Rishix500/ray-image-vae-v3-512` | **Private**. |
+| Legacy v3 model | `Rishix500/ray-image-dit-n8-v3` | **Private**. |
+| MONET + Qwen cache | [Rishix500/monet-qwen-cache-200k-v4](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k-v4) | **Public**; dataset card reports **140,000 samples**, despite “200k” in repository name. |
+
+A public model repository does not mean its matching VAE, milestones, or every dependency are public. Check access and compatibility before attempting inference.
+
+## 🖼️ Legacy v3 sample grid
 
 The image above collects outputs for prompts such as golden-hour desert dunes, a deep-space nebula, stormy ocean waves, an enchanted forest, a volcanic eruption, cherry-blossom trees beside a lake, a neon alleyway, an autumn forest, an arctic glacier, and abstract watercolor.
 
@@ -69,7 +140,7 @@ The gallery is a set of **actual experimental model outputs**, not an architectu
 
 The observed pattern is that broad color, atmosphere, texture, and impressionistic composition can appear, while object structure and geometry are frequently not recognizable enough. That gap is the central research problem for the next iteration.
 
-## ◈ Architecture
+## ◈ Legacy v3 architecture snapshot (source currently on main)
 
 ### Target generation path
 
@@ -184,7 +255,7 @@ These safeguards improve diagnosis and reduce avoidable incompatibility. They do
 | **Credentials and ephemeral sessions** | Environment variables do not survive fresh hosted sessions, and credentials should not be written into source or logs | Load secrets from environment variables at session start; never commit tokens or print them |
 | **Ambiguous checkpoints** | A weight file without stage/config provenance can be loaded through the wrong architecture | Store metadata, validate resume configuration and retain separate names for full and EMA checkpoints |
 
-## 📊 What the results mean — and do not mean
+## 📊 What the legacy v3 results mean — and do not mean
 
 ### What has been achieved
 
@@ -224,13 +295,16 @@ The project is experimental research code. Important remaining risks are documen
 
 ## 🤗 Models and datasets
 
-- **Current ~60M DiT v3 artifact (private at time of writing):** [ray-image-dit-n8-v3](https://huggingface.co/Rishix500/ray-image-dit-n8-v3)
-- **Earlier model artifact:** [ray-image-dit-n8-v2](https://huggingface.co/Rishix500/ray-image-dit-n8-v2)
-- **MONET + Qwen cache:** [monet-qwen-cache-200k](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k)
-- **VAE checkpoint repository:** [ray-image-vae-n8](https://huggingface.co/Rishix500/ray-image-vae-n8)
+- **Current v5 MoE model repository (public):** [ray-image-dit-v5-moe](https://huggingface.co/Rishix500/ray-image-dit-v5-moe)
+- **v5 milestones (private):** `Rishix500/ray-image-dit-v5-moe-milestones`
+- **v4 dense model and milestones (private):** `Rishix500/ray-image-dit-v4-100m-512` and `Rishix500/ray-image-dit-v4-100m-512-milestones`
+- **VAE v3 at 512px (private):** `Rishix500/ray-image-vae-v3-512`
+- **Legacy v3 model (private):** `Rishix500/ray-image-dit-n8-v3`
+- **Public MONET + Qwen cache:** [monet-qwen-cache-200k-v4](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k-v4) — its dataset card reports 140,000 samples; the “200k” name is historical.
+- **Earlier artifacts:** [ray-image-dit-n8-v2](https://huggingface.co/Rishix500/ray-image-dit-n8-v2), [ray-image-vae-n8](https://huggingface.co/Rishix500/ray-image-vae-n8). Their current visibility was not re-verified in this update.
 - **Author profile:** [Rishix500 on Hugging Face](https://huggingface.co/Rishix500)
 
-Large weights, caches and runtime artifacts intentionally live outside Git. A link to an artifact is a location reference, not a claim that its files are public or that all referenced checkpoints are mutually compatible.
+Large weights, caches and runtime artifacts intentionally live outside Git. A link is a location reference, not proof of public access, compatibility, or image quality. Visibility in the table reflects the metadata check performed on 6 November 2026.
 
 ## ⚙️ Reproduce and inspect
 
@@ -300,18 +374,19 @@ python -m ray_image.generate \
 
 For CFG, the sampler needs the null-prompt embedding path. The v3 loader checks checkpoint stage and latent-space metadata; use the matching checkpoint/VAE pair and follow the error messages rather than bypassing compatibility checks.
 
-## 🗺️ Roadmap — proposed work, not completed work
+## 🗺️ Next validation priorities
 
-The next phase should measure whether more spatial information and controlled training changes improve recognisable geometry before scaling the model blindly.
+The current research priority is to establish whether v4/v5 are improving prompt-conditioned image generation—not simply to increase parameter count or training steps.
 
-- **Higher-resolution VAE experiment:** train and evaluate a 512 × 512-capable VAE path, including reconstruction measurements.
-- **Higher-resolution cache:** build and validate matching VAE/text caches with explicit source-range accounting.
-- **~100M DiT experiment:** test a larger model at the higher latent resolution using controlled training settings and fixed evaluation prompts.
-- **Evaluation harness:** add a reproducible held-out prompt set and objective metrics such as CLIP-based alignment, plus a documented human review protocol.
-- **Resume hardening:** persist and restore EMA and RNG states where practical.
-- **Release hardening:** make the intended checkpoint and companion artifacts accessible, add a model card with limitations and intended use, and document compatible versions and inference steps.
+- **Measure text steering:** run the real-prompt versus null-prompt velocity comparison at identical noise and timestep.
+- **Review the v5 170k checkpoint:** produce a same-prompt, same-seed comparison against the 135k grid.
+- **Improve MoE utilisation:** test higher capacity factors and measure fully-dropped tokens and per-expert routing.
+- **Add v4/v5 test coverage:** commit smoke tests for forward passes, routing, warm start, checkpoint resume, and sampling; then extend CI.
+- **Harden training operations:** verify Kaggle disk cleanup, handle interrupted-download remnants, and compare warm-start schedules under controlled runs.
+- **Complete inference documentation:** provide a reproducible v4/v5 inference entry point and verify access to the matching VAE and other required artifacts.
+- **Build a formal evaluation protocol:** fixed prompts and seeds, human review, and suitable quantitative metrics before making quality claims.
 
-A 100M / 512 experiment and anime-specific adaptation are **future plans**, not capabilities of the current 60M release. Higher resolution may help with detail, but recognizable output is not guaranteed without evidence from experiments.
+These are validation and engineering priorities. Do not describe them as completed until the corresponding test or artifact exists.
 
 ## 🗂️ Repository map
 
