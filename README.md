@@ -65,7 +65,7 @@ The `main` branch preserves the v3 source snapshot as the repository's historica
 |---|---|---:|---|
 | **v3** | Dense DiT | ~60M | Earlier real-image baseline; 300k-step training milestone. |
 | **v4** | Dense DiT with 2D axial RoPE, SwiGLU, and gated text cross-attention | **110,724,750 counted** | Trained; its 120k checkpoint provides the v5 warm start. |
-| **v5** | v4 backbone with sparse MoE FFNs: 1 shared + 8 routed SwiGLU experts, top-2 routing | **~482M total; ~204M active/token (computed)** | Active training record reached approximately 171.4k steps. |
+| **v5** | v4 backbone with sparse MoE FFNs: 1 shared + 8 routed SwiGLU experts, top-2 routing | **~482M total; ~204M active/token (computed)** | Training logs supplied for this report reach ~171.4k steps; Hugging Face contains full and EMA checkpoint files through **175k**. |
 
 ### Shared v4/v5 system configuration
 
@@ -113,21 +113,51 @@ I use the loss, velocity MSE, routing statistics, and EMA drift to monitor optim
 7. **Complete the v4/v5 inference interface:** provide a reproducible command-line sampling path using the matching model and VAE artifacts.
 8. **Build a repeatable quality evaluation:** use fixed prompts and seeds, a structured visual review, and quantitative metrics when the evaluation protocol is ready.
 
-### Hugging Face artifacts and access
+### Hugging Face artifacts: verified repository inventory
 
-The following visibility checks were made against Hugging Face repository metadata on **6 November 2026**. Private repositories are identified for artifact provenance; only public repositories are linked as downloadable resources.
+I inspected the authenticated `Rishix500` Hugging Face account and enumerated the repository file trees on **6 November 2026**. The inventory below records actual file presence and filenames; it does not by itself prove that a checkpoint loads correctly or produces a particular image.
 
-| Artifact | Repository | Access |
+#### DiT checkpoints
+
+| Repository | Visibility | Files present |
 |---|---|---|
-| **v5 MoE main** | [Rishix500/ray-image-dit-v5-moe](https://huggingface.co/Rishix500/ray-image-dit-v5-moe) | **Public**; project records identify the ~170k checkpoint. |
-| **v5 milestones** | `Rishix500/ray-image-dit-v5-moe-milestones` | Private. |
-| **v4 dense model** | `Rishix500/ray-image-dit-v4-100m-512` | Private. |
-| **v4 milestones** | `Rishix500/ray-image-dit-v4-100m-512-milestones` | Private. |
-| **VAE v3 at 512px** | `Rishix500/ray-image-vae-v3-512` | Private. |
-| **Legacy v3 model** | `Rishix500/ray-image-dit-n8-v3` | Private. |
-| **MONET + Qwen cache** | [Rishix500/monet-qwen-cache-200k-v4](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k-v4) | Public; its dataset card reports **140,000 samples** despite the historical “200k” name. |
+| [`ray-image-dit-v5-moe`](https://huggingface.co/Rishix500/ray-image-dit-v5-moe) | **Public** | Full + EMA checkpoints at **160k, 165k, 170k, 175k**; `aux/null_prompt_emb.pt`. Full files are ~7.72 GB each; EMA files ~1.93 GB each. |
+| `ray-image-dit-v5-moe-milestones` | Private | Full + EMA milestone pairs at **130k, 140k, 150k, 160k, 170k**. |
+| `ray-image-dit-v4-100m-512` | Private | Full + EMA checkpoints at **105k, 110k, 115k, 120k**; `aux/null_prompt_emb.pt`. |
+| `ray-image-dit-v4-100m-512-milestones` | Private | Full + EMA milestone pairs at **80k, 90k, 100k, 110k, 120k**. |
+| `ray-image-dit-n8-v3` | Private | Full + EMA v3 checkpoint at **300k**; `aux/null_prompt_emb.pt`. |
+| `ray-image-dit-n8-v3-milestones` | Private | Full v3 checkpoint at **300k**; no EMA file was present in this repository inventory. |
+| [`ray-image-dit-n8-v2`](https://huggingface.co/Rishix500/ray-image-dit-n8-v2) | **Public** | One rescue checkpoint: `ray_dit_v2_step_0008500_rescue.pt` (~2.40 GB). |
 
-A public checkpoint repository and its companion VAE, milestone files, and datasets have separate access controls. Check the matching artifact permissions and model configuration before running inference.
+#### VAE checkpoints
+
+| Repository | Visibility | Files present |
+|---|---|---|
+| `ray-image-vae-v3-512` | Private | VAE v3 checkpoints every 500 steps from **500 through 30,000** (60 checkpoint files). The v4/v5 image path uses 512 × 512 RGB, 16 latent channels, and a 64 × 64 latent grid. |
+| `ray-image-vae-n8` | Private | VAE v2 checkpoint series every 500 steps from **500 through 47,500** (95 checkpoint files). Use with its matching N8-era code and latent convention. |
+| `ray-image-vae-n6` | Private | `ray_vae_v1_n6_extended.pt`, `probe_report.json`, and `vae_latent_stats.json`. The report records a 16 × 8 × 8 latent shape from 512 toy images and a 12/12 toy probe suite; this is a prototype diagnostic, not a natural-image benchmark. |
+
+#### Cached latent/text datasets
+
+| Repository | Visibility | Files present and format |
+|---|---|---|
+| [`monet-qwen-cache-200k-v4`](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k-v4) | **Public** | **14** chunks, 0k–140k, 10,000 samples each. Per chunk: latents `[10000, 16, 64, 64]`, Qwen3-4B text embeddings `[10000, 128, 2560]`, and mask. The dataset card reports 140,000 samples; chunk 140k–150k was skipped due to source corruption. |
+| [`monet-qwen-cache-200k`](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k) | **Public** | **19** chunks, 0k–190k, 10,000-sample ranges. Older cache format: per sample latents `[16, 32, 32]`, text embeddings `[47, 2560]`, and mask. The 190k–200k range is absent. |
+| `monet-qwen-cache-100k` | Private | No cache data files were present at inspection; repository currently contains only `.gitattributes`. |
+| `monet-qwen-cache-50k` | Private | No cache data files were present at inspection; repository currently contains only `.gitattributes`. |
+
+#### Spaces
+
+[`Rishix500/Rey`](https://huggingface.co/spaces/Rishix500/Rey) and [`Rishix500/Reyx5000`](https://huggingface.co/spaces/Rishix500/Reyx5000) are static starter templates (default welcome page, HTML, and CSS). They are not RAY-IMAGE inference demos and are not presented as working model interfaces.
+
+#### What this evidence establishes
+
+- The v5 public model repository contains four recent full checkpoints and four EMA checkpoints, with the newest named checkpoint at 175k.
+- The v4 and v5 milestone archives contain the milestone files listed above, but those archives and the VAE companion repository are private.
+- The public cache v4 contains 140k samples, while the older public cache contains 190k samples.
+- The account also contains historical N6, N7, N8, and v3 artifacts, with different levels of configuration and evaluation metadata.
+
+**Verification boundary:** this was a repository-tree and file-metadata inspection. I did not download and deserialize multi-gigabyte checkpoint tensors, execute the sampler, or generate a controlled v4/v5 image grid in this inspection. Visual quality, checkpoint integrity, and exact model-to-VAE compatibility still require a controlled inference run.
 
 ## 🖼️ v3 sample gallery — historical baseline
 
