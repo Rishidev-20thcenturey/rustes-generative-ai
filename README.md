@@ -101,9 +101,11 @@ with the prompt and with the null prompt, and the two velocities are combined.
 
 ### Data
 
-Training uses a precomputed cache of 20 chunks of 10,000 samples each (200k in total). Each sample
-holds the VAE latent and the Qwen text embedding, so the VAE and the text encoder do not run during
-training.
+Training consumes a precomputed cache of VAE latents and Qwen3-4B text embeddings, so neither
+encoder runs in the DiT training loop. The currently linked Hugging Face dataset is named
+`monet-qwen-cache-200k-v4`, but its dataset card reports **140,000 samples**, not 200,000. Treat
+the card's stated count as the published metadata and verify the actual shard inventory and sample
+coverage for each run before describing the cache as complete or assuming a 200k sample count.
 
 Chunks are loaded in **windows** of 50,000 optimizer steps. At each window boundary:
 
@@ -362,16 +364,17 @@ not a statement that the files are public or compatible with each other.
 
 | Artifact | Repository | Notes |
 |---|---|---|
-| v3 model (legacy, ~60M) | [Rishix500/ray-image-dit-n8-v3](https://huggingface.co/Rishix500/ray-image-dit-n8-v3) | Private at the time of writing. |
-| v2 model | [Rishix500/ray-image-dit-n8-v2](https://huggingface.co/Rishix500/ray-image-dit-n8-v2) | Earlier artifact. |
-| v4 model (dense, 110.7M) | `Rishix500/ray-image-dit-v4-100m-512` (referenced by `train_dit_v4.py`) | Milestones: `…-milestones`. |
-| v5 model (MoE) | `Rishix500/ray-image-dit-v5-moe` (referenced by `train_dit_v5.py`) | Milestones: `…-moe-milestones`. |
-| VAE v3 (512 px) | `Rishix500/ray-image-vae-v3-512` (referenced by the trainers) | Checkpoint `ray_vae_v3_step_0030000.pt`. |
-| Training cache (v4, 200k) | [Rishix500/monet-qwen-cache-200k-v4](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k-v4) | Default `--cache-repo`. |
-| Earlier cache (200k) | [Rishix500/monet-qwen-cache-200k](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k) | Earlier format. |
+| v3 model (legacy, ~60M) | `Rishix500/ray-image-dit-n8-v3` | Private; not publicly downloadable. |
+| v4 model (dense, 110.7M) | `Rishix500/ray-image-dit-v4-100m-512` | Private (visibility checked 6 Nov 2026). |
+| v4 milestones | `Rishix500/ray-image-dit-v4-100m-512-milestones` | Private (visibility checked 6 Nov 2026). |
+| v5 model (MoE) | [Rishix500/ray-image-dit-v5-moe](https://huggingface.co/Rishix500/ray-image-dit-v5-moe) | Public repository (visibility checked 6 Nov 2026); the project record reports a 170k checkpoint. |
+| v5 milestones | `Rishix500/ray-image-dit-v5-moe-milestones` | Private (visibility checked 6 Nov 2026). |
+| VAE v3 (512 px) | `Rishix500/ray-image-vae-v3-512` | Private (visibility checked 6 Nov 2026). |
+| Training cache | [Rishix500/monet-qwen-cache-200k-v4](https://huggingface.co/datasets/Rishix500/monet-qwen-cache-200k-v4) | Public; its dataset card reports 140,000 samples despite the `200k` name. |
 
-Access to the v4, v5, and VAE repositories has not been verified here; check their visibility before
-linking them publicly.
+Visibility was checked against Hugging Face repository metadata on 6 Nov 2026. Only the v5 main
+model repository and the cache dataset were public among the current artifacts listed above. Private
+repository identifiers are shown for provenance, not as public download links.
 
 The repository has **no `LICENSE` file**, so no license is granted by default. Add one before any
 redistribution.
