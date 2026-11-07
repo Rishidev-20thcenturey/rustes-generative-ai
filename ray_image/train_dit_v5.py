@@ -329,8 +329,12 @@ def load_resume(path: Path, dit, optimizer, ema, scaler, args):
     dit.load_state_dict(data["dit"], strict=True)
     if "optimizer" in data:
         optimizer.load_state_dict(data["optimizer"])
+    else:
+        print("[resume] WARNING: checkpoint has no optimizer state; AdamW moments restart from zero")
     if scaler.is_enabled() and "scaler" in data:
         scaler.load_state_dict(data["scaler"])
+    elif scaler.is_enabled():
+        print("[resume] WARNING: checkpoint has no GradScaler state; loss scale restarts")
     if "ema" in data:
         ema.load_state_dict(data["ema"], strict=True)
     else:

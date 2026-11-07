@@ -219,6 +219,7 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
     masks = torch.zeros((n_rows, CACHE_TOKENS), dtype=torch.bool)
     cached = 0
     seen = 0
+    next_log = LOG_EVERY  # log every LOG_EVERY source rows, whatever batch boundary they land on
     skip_reasons = Counter()
     retries_before = source.retries
     skipped_before = source.skipped_rows
@@ -296,10 +297,11 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
             masks[cached] = mask[i]
             cached += 1
 
-        if seen % LOG_EVERY == 0 or seen >= n_rows:
+        if seen >= next_log or seen >= n_rows:
             print(f"[progress] chunk={start//1000}k-{end//1000}k source_row={source.position} "
                   f"seen={seen}/{n_rows} cached={cached} skipped={sum(skip_reasons.values())} "
-                  f"{dict(skip_reasons)}")
+                  f"{dict(skip_reasons)}", flush=True)
+            next_log = (seen // LOG_EVERY + 1) * LOG_EVERY
 
     if cached == 0:
         raise RuntimeError(f"No valid samples produced for chunk {start}:{end}")
@@ -390,6 +392,20 @@ def purge_hf_hub_cache(log=print) -> int:
             part.unlink()
             log(f"[purge] deleted partial download {part.name}")
     log(f"[purge] kept model caches (models--*); freed {freed / (1024 ** 3):.2f} GB")
+    return freed
+
+
+def purge_stale_partials(output_dir: Path, log=print) -> int:
+    """Delete *.pt.partial left by a build that was killed during torch.save. Returns bytes freed.
+
+    Only called between chunks, when this process has no open partial file of its own.
+    """
+    freed = 0
+    for part in output_dir.glob("*.pt.partial"):
+        if part.is_file() and not part.is_symlink():
+            freed += part.stat().st_size
+            part.unlink()
+            log(f"[purge] deleted stale partial chunk {part.name}")
     return freed
 
 
@@ -543,6 +559,7 @@ def main() -> None:
             local_path.unlink()
             print(f"[purge] deleted local {filename}")
             purge_hf_hub_cache()
+            purge_stale_partials(output_dir)
         completed += 1
 
     print(f"[done] completed {completed}/{args.end_chunk - args.start_chunk} chunks; "
