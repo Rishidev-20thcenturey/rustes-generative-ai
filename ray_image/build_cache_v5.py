@@ -28,6 +28,7 @@ import os
 import re
 import string
 import shutil
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -38,6 +39,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi, constants, create_repo, hf_hub_download
 from PIL import Image
 
+from .parquet_source import ParquetRowSource, list_parquet_files
 from .text_encoder import RAYTextEncoder
 from .vae_v3 import IMAGE_SIZE, LATENT_SIZE, RAYVAE_v3
 
@@ -101,6 +103,63 @@ class FailedRow:
     def __init__(self, position: int, error: str):
         self.position = position
         self.error = error
+
+
+class Heartbeat:
+    """Background progress thread, so a hang shows up in the log within minutes.
+
+    Prints a [heartbeat] line every interval_s with the current source row and seconds since the
+    last row was read. After stall_s with no row, prints one [stall] line (once per stall). It
+    does not kill anything: a stall is a signal to look at the log and restart if it persists.
+    """
+
+    def __init__(self, interval_s: float = 60.0, stall_s: float = 300.0, log=None,
+                 clock=time.monotonic):
+        self._interval = interval_s
+        self._stall = stall_s
+        self._log = log or (lambda message: print(message, flush=True))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last = clock()
+        self._position = None
+        self._stalled = False
+        self._stop = threading.Event()
+        self._thread = None
+        self.stall_count = 0
+
+    def touch(self, position: int) -> None:
+        """Call once per source row read."""
+        with self._lock:
+            self._last = self._clock()
+            self._position = position
+            self._stalled = False
+
+    def check(self) -> None:
+        """One heartbeat tick. Called by the thread; public so tests can drive it."""
+        with self._lock:
+            idle = self._clock() - self._last
+            position = self._position
+            stalled = self._stalled
+            if idle >= self._stall and not stalled:
+                self._stalled = True
+                self.stall_count += 1
+        if idle >= self._stall and not stalled:
+            self._log(f"[stall] no source row for {idle:.0f}s (last row read: {position}). "
+                      f"The reader may be stuck; check the log and restart if this does not clear.")
+        else:
+            self._log(f"[heartbeat] last source row read: {position}; idle {idle:.0f}s")
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.check()
+
+    def start(self) -> "Heartbeat":
+        self._thread = threading.Thread(target=self._run, name="heartbeat", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 class SafeIterator:
@@ -210,9 +269,9 @@ def render_caption(row: dict, template: str):
     return caption, None
 
 
-def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: torch.device,
+def build_chunk(source, n_rows: int, vae, text_encoder, device: torch.device,
                 batch_size: int, image_column: str, caption_column: str, dataset_name: str,
-                start: int, end: int, caption_template=None) -> dict:
+                start: int, end: int, caption_template=None, heartbeat=None) -> dict:
     """Encode the next n_rows source rows into a chunk payload. Raises SourceExhausted if the source ends early."""
     latents = torch.empty((n_rows, LATENT_CHANNELS, LATENT_SIZE, LATENT_SIZE), dtype=torch.float16)
     text_embs = torch.empty((n_rows, CACHE_TOKENS, TEXT_DIM), dtype=torch.float16)
@@ -231,6 +290,8 @@ def build_chunk(source: SafeIterator, n_rows: int, vae, text_encoder, device: to
         while len(images) < batch_size and seen < n_rows:
             try:
                 sample = next(source)
+                if heartbeat is not None:
+                    heartbeat.touch(source.position)
             except StopIteration:
                 raise SourceExhausted(
                     f"source ended after {seen} of {n_rows} rows at source position {source.position}"
@@ -452,11 +513,107 @@ def validate_args(args) -> None:
         raise ValueError("--chunk-size must be a positive multiple of 1000 (chunk file names use thousands)")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
+    if args.source_format == "parquet" and not args.parquet_glob.strip():
+        raise ValueError("--parquet-glob is required with --source-format parquet")
+    if args.probe_rows < 0:
+        raise ValueError("--probe-rows must be >= 0")
+    if args.heartbeat_s <= 0 or args.stall_s <= 0:
+        raise ValueError("--heartbeat-s and --stall-s must be > 0")
     if not args.no_hf_upload and not args.hf_repo:
         raise ValueError("--hf-repo is required unless --no-hf-upload is set")
     if args.chunk_size != DEFAULT_CHUNK_SIZE:
         print(f"[warn] --chunk-size {args.chunk_size} differs from the trainer's {DEFAULT_CHUNK_SIZE}; "
               "the trainer's chunk ids will not line up with these files")
+
+
+def source_columns(args) -> list:
+    """Columns the parquet reader needs: the image plus the caption field(s) only."""
+    if args.caption_template is None:
+        caption_fields = {args.caption_column}
+    else:
+        caption_fields = template_fields(args.caption_template)
+    return sorted({args.image_column} | caption_fields)
+
+
+def make_source(args, start_position: int, log=print):
+    """Row source for the build. Returns a SafeIterator (datasets) or ParquetRowSource (parquet)."""
+    if args.source_format == "parquet":
+        token = os.getenv("HF_TOKEN")
+        files = list_parquet_files(args.dataset_name, args.parquet_glob, token=token)
+        print(f"[parquet] {len(files)} file(s) match {args.parquet_glob!r} in {args.dataset_name}: "
+              f"{files[0]} .. {files[-1]}", flush=True)
+        t0 = time.monotonic()
+        source = ParquetRowSource(args.dataset_name, files, source_columns(args), args.image_column,
+                                  start=start_position, log=log, token=token)
+        print(f"[parquet] indexed {source.total_rows:,} rows in {len(files)} files "
+              f"({time.monotonic() - t0:.1f}s, footer pass; each file is downloaded once here)", flush=True)
+        if start_position > source.total_rows:
+            raise SystemExit(f"[stop] start row {start_position:,} is past the end of the dataset "
+                             f"({source.total_rows:,} rows)")
+        return source
+
+    def open_at(position: int):
+        return load_dataset(args.dataset_name, args.dataset_config, split=args.image_split,
+                            streaming=True).skip(position)
+
+    return SafeIterator(open_at, start=start_position, log=log)
+
+
+def run_probe(args, source, heartbeat) -> None:
+    """Read --probe-rows rows from the source on this machine only (no models, no upload).
+
+    Measures the source on its own: row reads, image decode, caption render. Use it to confirm
+    the reader gets past the rows that stalled the full build.
+    """
+    counts = Counter()
+    errors = []
+    t0 = time.monotonic()
+    begin = source.position
+    first_error_at = {}
+    for _ in range(args.probe_rows):
+        try:
+            sample = next(source)
+        except StopIteration:
+            counts["end_of_source"] += 1
+            break
+        heartbeat.touch(source.position)
+        if isinstance(sample, FailedRow):
+            counts["source_error"] += 1
+            if len(errors) < 10:
+                errors.append(f"row {sample.position}: {sample.error}")
+            continue
+        image = sample.get(args.image_column)
+        if image is None:
+            counts["no_image"] += 1
+            continue
+        if args.caption_template is None:
+            caption = sample.get(args.caption_column)
+            reason = None if isinstance(caption, str) and caption.strip() else "empty_caption"
+        else:
+            caption, reason = render_caption(sample, args.caption_template)
+        if reason is not None:
+            counts[reason] += 1
+            continue
+        if not sanitize_caption(caption):
+            counts["caption_dropped"] += 1
+            continue
+        try:
+            preprocess_image(image)
+        except (TypeError, ValueError, OSError) as exc:
+            counts["preprocess_error"] += 1
+            first_error_at.setdefault("preprocess_error", f"row {source.position - 1}: {exc}")
+            continue
+        counts["ok"] += 1
+    elapsed = time.monotonic() - t0
+    rows = source.position - begin
+    print(f"[probe] read rows {begin:,}..{source.position:,} ({rows:,} rows in {elapsed:.1f}s, "
+          f"{rows / max(elapsed, 1e-9):.1f} rows/s)")
+    print(f"[probe] outcome {dict(counts)}; source retries={source.retries} "
+          f"source failed rows={source.skipped_rows}")
+    for line in errors:
+        print(f"[probe] {line}")
+    for key, value in first_error_at.items():
+        print(f"[probe] first {key}: {value}")
 
 
 def main() -> None:
@@ -482,8 +639,29 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda", help="cuda (default) or cpu for tests")
+    parser.add_argument("--source-format", choices=["datasets", "parquet"], default="datasets",
+                        help="datasets: HF datasets streaming (default). parquet: read the Parquet files "
+                             "directly, one row group at a time (see parquet_source.py).")
+    parser.add_argument("--parquet-glob", type=str, default="data/*.parquet",
+                        help="with --source-format parquet: repo file pattern, sorted to give the row order")
+    parser.add_argument("--probe-rows", type=int, default=0,
+                        help="read this many source rows on the CPU (no models, no upload) and report, then exit")
+    parser.add_argument("--heartbeat-s", type=float, default=60.0, help="progress line interval, seconds")
+    parser.add_argument("--stall-s", type=float, default=300.0,
+                        help="print [stall] after this many seconds with no source row")
     args = parser.parse_args()
+    if args.probe_rows > 0:
+        args.no_hf_upload = True  # the probe never uploads or deletes anything
     validate_args(args)
+
+    if args.probe_rows > 0:
+        source = make_source(args, args.start_chunk * args.chunk_size - args.source_offset)
+        heartbeat = Heartbeat(args.heartbeat_s, args.stall_s).start()
+        try:
+            run_probe(args, source, heartbeat)
+        finally:
+            heartbeat.stop()
+        return
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -508,12 +686,9 @@ def main() -> None:
     text_encoder = RAYTextEncoder(model_name=RAYTextEncoder.MODEL_ID, max_tokens=CACHE_TOKENS,
                                   load_in_8bit=True).eval()
 
-    def open_at(position: int):
-        return load_dataset(args.dataset_name, args.dataset_config, split=args.image_split,
-                            streaming=True).skip(position)
-
     offset = args.source_offset
-    source = SafeIterator(open_at, start=args.start_chunk * args.chunk_size - offset)
+    source = make_source(args, args.start_chunk * args.chunk_size - offset)
+    heartbeat = Heartbeat(args.heartbeat_s, args.stall_s).start()
     print(f"[window] dataset={args.dataset_name}:{args.image_split} chunks {args.start_chunk}.."
           f"{args.end_chunk - 1} (global rows {args.start_chunk * args.chunk_size:,}.."
           f"{args.end_chunk * args.chunk_size:,}; dataset rows "
@@ -543,7 +718,7 @@ def main() -> None:
             try:
                 payload = build_chunk(source, args.chunk_size, vae, text_encoder, device, args.batch_size,
                                       args.image_column, args.caption_column, args.dataset_name, start, end,
-                                      caption_template=args.caption_template)
+                                      caption_template=args.caption_template, heartbeat=heartbeat)
             except SourceExhausted as exc:
                 print(f"[stop] chunk {index} not written: {exc}. Earlier chunks are complete.")
                 raise SystemExit(1)
@@ -562,8 +737,10 @@ def main() -> None:
             purge_stale_partials(output_dir)
         completed += 1
 
+    heartbeat.stop()
     print(f"[done] completed {completed}/{args.end_chunk - args.start_chunk} chunks; "
-          f"source retries={source.retries} skipped source rows={source.skipped_rows}")
+          f"source retries={source.retries} skipped source rows={source.skipped_rows} "
+          f"stalls={heartbeat.stall_count}")
 
 
 if __name__ == "__main__":
