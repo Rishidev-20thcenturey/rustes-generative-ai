@@ -39,7 +39,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi, constants, create_repo, hf_hub_download
 from PIL import Image
 
-from .parquet_source import ParquetRowSource, list_parquet_files
+from .parquet_source import FailedRow, ParquetRowSource, list_parquet_files
 from .text_encoder import RAYTextEncoder
 from .vae_v3 import IMAGE_SIZE, LATENT_SIZE, RAYVAE_v3
 
@@ -95,14 +95,6 @@ class SourceExhausted(RuntimeError):
 def chunk_filename(start: int, end: int) -> str:
     # Same name the v4/v5 trainers build (see train_dit_v4.chunk_filename).
     return f"monet_qwen_cache_{start // 1000}k_{end // 1000}k.pt"
-
-
-class FailedRow:
-    """Yielded in place of a source row that could not be read after all retries."""
-
-    def __init__(self, position: int, error: str):
-        self.position = position
-        self.error = error
 
 
 class Heartbeat:
@@ -559,7 +551,7 @@ def make_source(args, start_position: int, log=print):
     return SafeIterator(open_at, start=start_position, log=log)
 
 
-def run_probe(args, source, heartbeat) -> None:
+def run_probe(args, source, heartbeat) -> bool:
     """Read --probe-rows rows from the source on this machine only (no models, no upload).
 
     Measures the source on its own: row reads, image decode, caption render. Use it to confirm
@@ -614,6 +606,19 @@ def run_probe(args, source, heartbeat) -> None:
         print(f"[probe] {line}")
     for key, value in first_error_at.items():
         print(f"[probe] first {key}: {value}")
+    # Pass only if every row was readable and at least one row is usable.
+    problems = []
+    if counts["source_error"]:
+        problems.append(f"{counts['source_error']} unreadable source row(s)")
+    if counts["end_of_source"]:
+        problems.append("source ended before --probe-rows")
+    if counts["ok"] == 0:
+        problems.append("no usable rows")
+    if problems:
+        print(f"[probe] failed: {'; '.join(problems)}")
+        return False
+    print("[probe] passed")
+    return True
 
 
 def main() -> None:
@@ -658,10 +663,10 @@ def main() -> None:
         source = make_source(args, args.start_chunk * args.chunk_size - args.source_offset)
         heartbeat = Heartbeat(args.heartbeat_s, args.stall_s).start()
         try:
-            run_probe(args, source, heartbeat)
+            passed = run_probe(args, source, heartbeat)
         finally:
             heartbeat.stop()
-        return
+        raise SystemExit(0 if passed else 2)
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():

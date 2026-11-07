@@ -324,6 +324,51 @@ class ProbeTests(unittest.TestCase):
             self.assertIn("rows 0..5", text)
 
 
+class ProbeGateTests(unittest.TestCase):
+    def _run(self, layout, probe_rows, break_group=None):
+        from ray_image import build_cache_v5 as b
+        with tempfile.TemporaryDirectory() as d:
+            paths = make_files(d, layout)
+            names = [os.path.basename(p) for p in paths]
+            by_name = dict(zip(names, paths))
+            real = pq.ParquetFile
+
+            class Broken(real):
+                def read_row_group(self, rg, *a, **k):
+                    if break_group is not None and rg == break_group:
+                        raise OSError("simulated corrupt page")
+                    return super().read_row_group(rg, *a, **k)
+
+            src = ParquetRowSource("local/test", names, ["image", "caption", "row_id"], "image",
+                                   fetch_file=lambda n: by_name[n], sleep=lambda s: None,
+                                   log=lambda *a, **k: None, max_retries=0)
+            args = Namespace(probe_rows=probe_rows, image_column="image", caption_column="caption",
+                             caption_template=None, start_chunk=0, chunk_size=10_000)
+            hb = b.Heartbeat(60, 300, log=lambda message: None)
+            with mock.patch.object(ps.pq, "ParquetFile", Broken), \
+                    mock.patch.object(b, "preprocess_image", lambda im: im.convert("RGB")), \
+                    mock.patch("builtins.print", lambda *a, **k: None):
+                return b.run_probe(args, src, hb)
+
+    good = [[[("a red square on a white background", png_bytes((1, 1, 1)))]]]
+
+    def test_gate_passes_on_clean_rows(self):
+        self.assertTrue(self._run(self.good, 1))
+
+    def test_gate_fails_on_unreadable_row_group(self):
+        layout = [[[("a red square on a white background", png_bytes((1, 1, 1)))],
+                   [("a blue circle on a dark green field", png_bytes((2, 2, 2)))]]]
+        self.assertFalse(self._run(layout, 2, break_group=1))
+
+    def test_gate_fails_when_source_is_too_short(self):
+        self.assertFalse(self._run(self.good, 5))
+
+
+class SharedFailedRowTests(unittest.TestCase):
+    def test_build_script_uses_the_parquet_source_failed_row(self):
+        from ray_image import build_cache_v5 as b
+        self.assertIs(b.FailedRow, ps.FailedRow)
+
 class SourceColumnsTests(unittest.TestCase):
     def test_columns_include_only_needed_fields(self):
         from ray_image import build_cache_v5 as b
