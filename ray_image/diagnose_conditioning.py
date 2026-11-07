@@ -37,7 +37,7 @@ from PIL import Image
 from .cfg import NULL_PROMPT, NULL_PROMPT_FILENAME, fit_null_to_length, validate_null_payload
 from .dit_v4 import LATENT_CHANNELS, LATENT_SIZE, MODEL_DEPTH, MODEL_DIM, MODEL_HEADS
 from .dit_v5_moe import MOE_CAPACITY_FACTOR, MODEL_PATCH, RAYDiT_v5
-from .flow import euler_sample
+from .flow import euler_sample, predict_velocity_tensor
 from .text_encoder import RAYTextEncoder
 from .train_dit_v4 import VAE_DEFAULT_CHECKPOINT, VAE_DEFAULT_REPO, load_vae
 
@@ -68,6 +68,9 @@ REFERENCE_PROMPTS = [
     "a dense jungle with a waterfall and mist",
 ]
 CFG_LEVELS = [1.0, 3.0, 5.0, 7.5]
+ROUTING_AGREEMENT_FLOOR = 0.50   # below this, the router is treated as diverging (user's rule)
+EXPERT_COSINE_CEILING = 0.95     # above this, experts are treated as not specialised (user's rule)
+ROUTING_PROMPT = PROMPT_A
 CROSS_ATTN_MOVED_THRESHOLD = 0.02  # mean |pixel difference| in [0,1] units; a choice made here, not from the spec
 
 
@@ -153,6 +156,103 @@ def test_null_embedding(payload, live_null_hidden, live_null_mask, log):
     return {"stored_shape": list(emb.shape), "mask_shape": list(mask.shape), "valid_tokens": valid,
             "shape_ok": shape_ok, "mask_match": same_valid, "live_cosine": cos, "live_max_diff": diff,
             "passed": passed}
+
+
+def _velocity_with_capture(model, x, t, text, text_mask):
+    """One velocity evaluation that also returns each MoE layer's input tokens [n, dim]."""
+    store = [None] * len(model.blocks)
+    handles = []
+    for i, block in enumerate(model.blocks):
+        def hook(_module, inputs, i=i):
+            tokens = inputs[0].detach()
+            store[i] = tokens.reshape(-1, tokens.shape[-1])
+        handles.append(block.moe.register_forward_pre_hook(hook))
+    try:
+        v = predict_velocity_tensor(model, x, t, text, text_mask)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return v, store
+
+
+def _pairwise_expert_cosine(outputs: torch.Tensor):
+    """outputs: [E, n, d]. Returns (mean, max) per-token cosine over expert pairs, raw and centred."""
+    def pair_stats(vectors):
+        unit = torch.nn.functional.normalize(vectors, dim=-1)
+        values = []
+        for e in range(unit.shape[0]):
+            for f in range(e + 1, unit.shape[0]):
+                values.append(float((unit[e] * unit[f]).sum(-1).mean()))
+        return sum(values) / len(values), max(values)
+    raw_mean, raw_max = pair_stats(outputs)
+    centred = outputs - outputs.mean(dim=1, keepdim=True)
+    cen_mean, cen_max = pair_stats(centred)
+    return {"raw_mean": raw_mean, "raw_max": raw_max, "centred_mean": cen_mean, "centred_max": cen_max}
+
+
+@torch.no_grad()
+def test_routing_and_experts(model, text, text_mask, null_text, null_mask, steps: int, seed: int, cfg_scale: float,
+                             device, log):
+    """Run the real CFG sampler for one prompt and record, at every step and layer:
+    - routing agreement: fraction of tokens whose top-k expert set is the same for the real and null text;
+    - expert similarity: pairwise cosine between the routed experts' outputs on the real-text tokens.
+    Routing uses the router logits only (capacity dropping is not applied), which is the top-k choice.
+    """
+    layers = len(model.blocks)
+    agree_hits = torch.zeros(layers)
+    agree_total = torch.zeros(layers)
+    raw_means = [[] for _ in range(layers)]
+    raw_maxes = [[] for _ in range(layers)]
+    cen_means = [[] for _ in range(layers)]
+    cen_maxes = [[] for _ in range(layers)]
+    torch.manual_seed(seed)
+    shape = (1, LATENT_CHANNELS, LATENT_SIZE, LATENT_SIZE)
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    for i in range(steps):
+        t = torch.full((shape[0],), 1.0 - i * dt, device=device)
+        v_cond, cap_cond = _velocity_with_capture(model, x, t, text, text_mask)
+        v_null, cap_null = _velocity_with_capture(model, x, t, null_text, null_mask)
+        for layer, block in enumerate(model.blocks):
+            moe = block.moe
+            top_cond = torch.topk(moe.router(cap_cond[layer].float()), moe.top_k, dim=-1).indices
+            top_null = torch.topk(moe.router(cap_null[layer].float()), moe.top_k, dim=-1).indices
+            same = (torch.sort(top_cond, dim=-1).values == torch.sort(top_null, dim=-1).values).all(dim=-1)
+            agree_hits[layer] += float(same.sum())
+            agree_total[layer] += float(same.numel())
+            outputs = torch.stack([expert(cap_cond[layer]).float() for expert in moe.experts])
+            stats = _pairwise_expert_cosine(outputs)
+            raw_means[layer].append(stats["raw_mean"])
+            raw_maxes[layer].append(stats["raw_max"])
+            cen_means[layer].append(stats["centred_mean"])
+            cen_maxes[layer].append(stats["centred_max"])
+        v = v_null + cfg_scale * (v_cond - v_null)
+        x = x - dt * v
+
+    per_layer_agreement = (agree_hits / agree_total.clamp_min(1)).tolist()
+    overall_agreement = float(agree_hits.sum() / agree_total.sum().clamp_min(1))
+    mean = lambda values: sum(values) / len(values)
+    per_layer_raw = [mean(values) for values in raw_means]
+    per_layer_centred = [mean(values) for values in cen_means]
+    overall_raw = mean(per_layer_raw)
+    overall_centred = mean(per_layer_centred)
+    log(f"routing agreement (top-{model.blocks[0].moe.top_k} sets, real vs null text, CFG {cfg_scale}): "
+        f"overall {overall_agreement:.3f}")
+    log("  per layer: " + " ".join(f"L{i}={v:.2f}" for i, v in enumerate(per_layer_agreement)))
+    log(f"expert output cosine (routed experts on real-text tokens): raw mean {overall_raw:.3f}, "
+        f"raw max {max(max(v) for v in raw_maxes):.3f}; centred mean {overall_centred:.3f}")
+    routing_verdict = ("DIVERGING: agreement below 50%, CFG mixes different expert subsets"
+                       if overall_agreement < ROUTING_AGREEMENT_FLOOR else "OK: router agrees on most tokens")
+    expert_verdict = ("NOT SPECIALISED: expert outputs above 0.95 raw cosine"
+                      if overall_raw > EXPERT_COSINE_CEILING else "OK: expert outputs differ")
+    log(f"routing verdict: {routing_verdict}")
+    log(f"expert verdict: {expert_verdict}")
+    return {"routing_agreement_overall": overall_agreement, "routing_agreement_per_layer": per_layer_agreement,
+            "expert_cosine_raw_mean": overall_raw, "expert_cosine_centred_mean": overall_centred,
+            "expert_cosine_raw_max": max(max(v) for v in raw_maxes),
+            "expert_cosine_per_layer_raw": per_layer_raw,
+            "routing_verdict": routing_verdict, "expert_verdict": expert_verdict,
+            "informational": True}
 
 
 def load_dit(ema_ckpt: Path, device, log):
@@ -263,6 +363,7 @@ def main() -> None:
         results["null_embedding"] = {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
 
     log("\n== Test 2: CFG sweep ==")
+    model = None
     try:
         if null_payload is None:
             raise RuntimeError("null prompt could not be loaded (see Test 3)")
@@ -278,10 +379,31 @@ def main() -> None:
         log(f"verdict: FAIL ({type(exc).__name__}: {exc})")
         results["cfg_sweep"] = {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    log("\n== Test 4: routing agreement and expert similarity (informational) ==")
+    try:
+        if model is None or null_payload is None:
+            raise RuntimeError("needs the loaded DiT and the null prompt (see Tests 2 and 3)")
+        routing_text = hidden[0][None].to(device)
+        routing_mask = mask[0][None].to(device)
+        null_fit_emb, null_fit_mask = fit_null_to_length(null_payload["emb"].float(), null_payload["mask"].bool(),
+                                                         TEXT_TOKENS)
+        results["routing"] = test_routing_and_experts(
+            model, routing_text, routing_mask, null_fit_emb[None].to(device), null_fit_mask[None].to(device),
+            args.steps, args.seed, 7.5, device, log)
+    except Exception as exc:
+        log(f"result: not run ({type(exc).__name__}: {exc})")
+        results["routing"] = {"informational": True, "error": f"{type(exc).__name__}: {exc}"}
+
     log("\n== Summary ==")
     for name, res in results.items():
+        if res.get("informational"):
+            if "error" in res:
+                log(f"{name}: not run ({res['error']})")
+            else:
+                log(f"{name}: {res['routing_verdict']} | {res['expert_verdict']}")
+            continue
         log(f"{name}: {'PASS' if res.get('passed') else 'FAIL'}")
-    alive = all(res.get("passed") for res in results.values())
+    alive = all(res.get("passed") for res in results.values() if not res.get("informational"))
     log(f"TEXT PATH {'ALIVE: safe to launch the 1M run' if alive else 'NOT CONFIRMED: do not launch the 1M run'}")
     (args.out_dir / "conditioning_check.json").write_text(json.dumps(results, indent=2, default=str))
     (args.out_dir / "conditioning_check.log").write_text("\n".join(lines) + "\n")
