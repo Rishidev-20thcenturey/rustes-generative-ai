@@ -43,7 +43,8 @@ from datasets import load_dataset
 from huggingface_hub import HfApi, constants, create_repo, hf_hub_download
 from PIL import Image
 
-from .parquet_source import FailedRow, ParquetRowSource, chunk_files, list_repo_files
+from .parquet_source import (ChunkAbandoned, FailedRow, ParquetRowSource, RandomSampleSource, chunk_files,
+                             list_repo_files, random_chunk_files)
 from .text_encoder import RAYTextEncoder
 from .vae_v3 import IMAGE_SIZE, LATENT_SIZE, RAYVAE_v3
 
@@ -509,13 +510,23 @@ def validate_args(args) -> None:
         raise ValueError("--chunk-size must be a positive multiple of 1000 (chunk file names use thousands)")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
+    if args.random_sample and args.source_format != "parquet":
+        raise ValueError("--random-sample requires --source-format parquet")
     if args.source_format == "parquet":
-        if "{chunk}" not in args.parquet_chunk_glob:
-            raise ValueError("--parquet-chunk-glob must contain {chunk}, e.g. 'v1.2.0/cc12m/{chunk}-0/*.parquet'")
-        try:
-            args.parquet_chunk_glob.format(chunk=0)
-        except (KeyError, IndexError, ValueError) as exc:
-            raise ValueError(f"--parquet-chunk-glob may only use the {{chunk}} field: {exc}")
+        if args.random_sample:
+            if not args.random_sample_glob.strip():
+                raise ValueError("--random-sample-glob must not be empty")
+            if args.random_sample_files <= 0:
+                raise ValueError("--random-sample-files must be >= 1")
+            if args.max_skipped < 0:
+                raise ValueError("--max-skipped must be >= 0")
+        else:
+            if "{chunk}" not in args.parquet_chunk_glob:
+                raise ValueError("--parquet-chunk-glob must contain {chunk}, e.g. 'v1.2.0/cc12m/{chunk}-0/*.parquet'")
+            try:
+                args.parquet_chunk_glob.format(chunk=0)
+            except (KeyError, IndexError, ValueError) as exc:
+                raise ValueError(f"--parquet-chunk-glob may only use the {{chunk}} field: {exc}")
         if args.source_offset != 0:
             raise ValueError("--source-offset must be 0 with --source-format parquet: each chunk reads its own folder")
     if args.probe_rows < 0:
@@ -570,6 +581,47 @@ def make_chunk_source(args, index: int, all_files: list, log=print):
     return source
 
 
+def make_validator(args):
+    """Row check used by random-sample mode. Mirrors the checks build_chunk does before encoding."""
+
+    def validate(row):
+        if row.get(args.image_column) is None:
+            return False, "no_image"
+        if args.caption_template is None:
+            caption = row.get(args.caption_column)
+            if not isinstance(caption, str) or not caption.strip():
+                return False, "empty_caption"
+        else:
+            caption, reason = render_caption(row, args.caption_template)
+            if caption is None:
+                return False, reason
+        if not sanitize_caption(caption):
+            return False, "caption_dropped"
+        return True, None
+
+    return validate
+
+
+def make_random_source(args, index: int, all_files: list, log=print):
+    """Random-sample source for one chunk: valid rows drawn from this chunk's own slice of files."""
+    files = random_chunk_files(all_files, args.random_sample_glob, args.seed, index, args.random_sample_files)
+    print(f"[random] chunk {index}: {len(files)} file(s), {files[0]} .. {files[-1]}", flush=True)
+    source = RandomSampleSource(args.dataset_name, files, source_columns(args), args.image_column,
+                                validate=make_validator(args), target=args.chunk_size,
+                                max_skipped=args.max_skipped, seed=args.seed * 1_000_003 + index,
+                                log=log, token=os.getenv("HF_TOKEN"))
+    print(f"[random] chunk {index}: {source.total_rows:,} candidate rows; need {args.chunk_size:,} valid; "
+          f"abandon after {args.max_skipped:,} rejected", flush=True)
+    return source
+
+
+def make_parquet_source(args, index: int, all_files: list, log=print):
+    """Parquet source for one chunk: random-sample mode or the fixed folder-per-chunk mode."""
+    if args.random_sample:
+        return make_random_source(args, index, all_files, log)
+    return make_chunk_source(args, index, all_files, log)
+
+
 def run_probe(args, source, heartbeat) -> bool:
     """Read --probe-rows rows from the source on this machine only (no models, no upload).
 
@@ -586,6 +638,10 @@ def run_probe(args, source, heartbeat) -> bool:
             sample = next(source)
         except StopIteration:
             counts["end_of_source"] += 1
+            break
+        except ChunkAbandoned as exc:
+            counts["abandoned"] += 1
+            errors.append(str(exc))
             break
         heartbeat.touch(source.position)
         if isinstance(sample, FailedRow):
@@ -631,6 +687,8 @@ def run_probe(args, source, heartbeat) -> bool:
         problems.append(f"{counts['source_error']} unreadable source row(s)")
     if counts["end_of_source"]:
         problems.append("source ended before --probe-rows")
+    if counts["abandoned"]:
+        problems.append("chunk would be abandoned (too many rejected rows)")
     if counts["ok"] == 0:
         problems.append("no usable rows")
     if problems:
@@ -670,6 +728,15 @@ def main() -> None:
                         help="with --source-format parquet: repo file pattern for ONE chunk, with {chunk} "
                              "replaced by the chunk index, e.g. 'v1.2.0/cc12m/{chunk}-0/*.parquet'. "
                              "Each chunk reads only its own files; the folder must hold exactly --chunk-size rows.")
+    parser.add_argument("--random-sample", action="store_true",
+                        help="parquet mode: draw each chunk's rows at random from its own slice of files "
+                             "(--random-sample-glob, --random-sample-files). Ignores --parquet-chunk-glob.")
+    parser.add_argument("--random-sample-glob", type=str, default="v1.2.0/cc12m/*.parquet",
+                        help="with --random-sample: repo files to draw from")
+    parser.add_argument("--random-sample-files", type=int, default=8,
+                        help="with --random-sample: files per chunk (disjoint across chunks; ~0.5 GB each for Monet)")
+    parser.add_argument("--max-skipped", type=int, default=2000,
+                        help="with --random-sample: abandon a chunk after more than this many rejected rows")
     parser.add_argument("--probe-rows", type=int, default=0,
                         help="read this many source rows on the CPU (no models, no upload) and report, then exit")
     parser.add_argument("--heartbeat-s", type=float, default=60.0, help="progress line interval, seconds")
@@ -685,7 +752,7 @@ def main() -> None:
         try:
             if args.source_format == "parquet":
                 all_files = list_repo_files(args.dataset_name, token=os.getenv("HF_TOKEN"))
-                source = make_chunk_source(args, args.start_chunk, all_files)
+                source = make_parquet_source(args, args.start_chunk, all_files)
             else:
                 source = make_datasets_source(args, args.start_chunk * args.chunk_size - args.source_offset)
             passed = run_probe(args, source, heartbeat)
@@ -734,6 +801,7 @@ def main() -> None:
           f"source-offset {offset:,})")
 
     completed = 0
+    abandoned = []
     for index in range(args.start_chunk, args.end_chunk):
         start = index * args.chunk_size
         end = start + args.chunk_size
@@ -757,13 +825,17 @@ def main() -> None:
             print(f"[build] chunk {index}: source rows {start}:{end}")
             try:
                 if parquet_mode:
-                    source = make_chunk_source(args, index, all_files)
+                    source = make_parquet_source(args, index, all_files)
                 payload = build_chunk(source, args.chunk_size, vae, text_encoder, device, args.batch_size,
                                       args.image_column, args.caption_column, args.dataset_name, start, end,
                                       caption_template=args.caption_template, heartbeat=heartbeat)
             except SourceExhausted as exc:
                 print(f"[stop] chunk {index} not written: {exc}. Earlier chunks are complete.")
                 raise SystemExit(1)
+            except ChunkAbandoned as exc:
+                print(f"[warn] chunk {index} ABANDONED, no file written: {exc}", flush=True)
+                abandoned.append(index)
+                continue
             except Exception:
                 print(f"[error] chunk {index} failed; rerun with the same arguments to retry it")
                 raise
@@ -788,6 +860,8 @@ def main() -> None:
     print(f"[done] completed {completed}/{args.end_chunk - args.start_chunk} chunks; "
           f"source retries={source.retries} skipped source rows={source.skipped_rows} "
           f"stalls={heartbeat.stall_count}")
+    if abandoned:
+        print(f"[warn] abandoned chunks (no file written; rerun with another --seed to retry): {abandoned}")
 
 
 if __name__ == "__main__":

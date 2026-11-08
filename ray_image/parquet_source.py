@@ -22,8 +22,10 @@ the whole dataset. Files are ordered by natural sort (2-0 before 10-0, 000002 be
 import bisect
 import fnmatch
 import io
+import random
 import re
 import time
+from collections import Counter
 
 import pyarrow.parquet as pq
 from PIL import Image
@@ -192,3 +194,108 @@ class ParquetRowSource:
         except Exception as exc:
             self._log(f"[parquet] row {position}: image decode failed: {type(exc).__name__}: {exc}")
             return None
+
+
+class ChunkAbandoned(RuntimeError):
+    """Too many rows were rejected to build this chunk. Nothing is written for it."""
+
+
+class RandomSampleSource:
+    """Yield `target` valid rows drawn at random, without replacement, from `files`.
+
+    Row groups are visited in random order, and rows inside a group in random order, so one
+    chunk mixes all of its files. A candidate is rejected if its read failed or validate(row)
+    returns (False, reason). Each rejection counts once. More than `max_skipped` rejections raises
+    ChunkAbandoned. Running out of rows before `target` valid ones ends iteration with StopIteration.
+
+    validate(row) -> (ok: bool, reason: str or None). It sees the decoded row; image is a PIL image or None.
+    """
+
+    def __init__(self, repo_id, files, columns, image_column, validate, target: int, max_skipped: int,
+                 seed: int, fetch_file=None, log=print, token=None,
+                 max_retries: int = MAX_RETRIES, backoff_s: float = RETRY_BACKOFF_S, sleep=time.sleep):
+        self._inner = ParquetRowSource(repo_id, files, columns, image_column, fetch_file=fetch_file,
+                                       start=0, max_retries=max_retries, backoff_s=backoff_s,
+                                       sleep=sleep, log=log, token=token)
+        self._validate = validate
+        self._target = target
+        self._max_skipped = max_skipped
+        self._rng = random.Random(seed)
+        self.total_rows = self._inner.total_rows
+        self.accepted = 0
+        self.skipped_rows = 0
+        self.reject_reasons = Counter()
+        self._candidates = self._iter_candidates()
+
+    @property
+    def retries(self) -> int:
+        return self._inner.retries
+
+    @property
+    def position(self) -> int:
+        """Candidate rows consumed so far (accepted plus rejected)."""
+        return self.accepted + self.skipped_rows
+
+    def __iter__(self):
+        return self
+
+    def _iter_candidates(self):
+        groups = self._inner._groups
+        order = list(range(len(groups)))
+        self._rng.shuffle(order)
+        for group_index in order:
+            _, _, group_start, n_rows = groups[group_index]
+            table, error = self._inner._load_group(group_index)
+            rows = list(range(n_rows))
+            self._rng.shuffle(rows)
+            for r in rows:
+                position = group_start + r
+                if table is None:
+                    yield FailedRow(position, error or "row group unreadable")
+                    continue
+                row = {name: table.column(name)[r].as_py() for name in self._inner._columns}
+                row[self._inner._image_column] = self._inner._decode_or_none(
+                    row[self._inner._image_column], position)
+                yield row
+
+    def _reject(self, reason: str) -> None:
+        self.skipped_rows += 1
+        self.reject_reasons[reason] += 1
+        if self.skipped_rows > self._max_skipped:
+            raise ChunkAbandoned(
+                f"{self.skipped_rows} rejected rows (limit {self._max_skipped}) after {self.accepted} of "
+                f"{self._target} accepted; reasons {dict(self.reject_reasons)}")
+
+    def __next__(self):
+        while True:
+            if self.accepted >= self._target:
+                raise StopIteration
+            candidate = next(self._candidates)  # StopIteration here: the files ran out
+            if isinstance(candidate, FailedRow):
+                self._reject("read_error")
+                continue
+            ok, reason = self._validate(candidate)
+            if not ok:
+                self._reject(reason or "invalid")
+                continue
+            self.accepted += 1
+            return candidate
+
+
+def random_chunk_files(all_files, pattern: str, seed: int, index: int, files_per_chunk: int) -> list:
+    """The files for chunk `index` in random-sample mode.
+
+    The matching files are shuffled once with `seed`. Chunk i gets the slice [i*k, (i+1)*k), so no
+    file is shared between chunks. Raises if the pool runs out.
+    """
+    pool = sorted((f for f in all_files if fnmatch.fnmatch(f, pattern)), key=natural_key)
+    if not pool:
+        raise RuntimeError(f"no files match {pattern!r}")
+    random.Random(seed).shuffle(pool)
+    start = index * files_per_chunk
+    if start + files_per_chunk > len(pool):
+        raise RuntimeError(
+            f"file pool exhausted: chunk {index} needs files {start}..{start + files_per_chunk} but only "
+            f"{len(pool)} files match {pattern!r} ({len(pool) // files_per_chunk} chunks fit)")
+    return pool[start:start + files_per_chunk]
+

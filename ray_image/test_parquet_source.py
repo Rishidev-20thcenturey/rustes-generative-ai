@@ -423,7 +423,9 @@ class ChunkFolderTests(unittest.TestCase):
         base = dict(caption_template=None, source_offset=0, start_chunk=14, end_chunk=15, chunk_size=10_000,
                     dataset_name="jasperai/monet", batch_size=8, source_format="parquet",
                     parquet_chunk_glob="v1.2.0/cc12m/{chunk}-0/*.parquet", probe_rows=0,
-                    heartbeat_s=60.0, stall_s=300.0, no_hf_upload=False, hf_repo="x/y", image_split="train")
+                    heartbeat_s=60.0, stall_s=300.0, no_hf_upload=False, hf_repo="x/y", image_split="train",
+                    random_sample=False, random_sample_glob="v1.2.0/cc12m/*.parquet",
+                    random_sample_files=8, max_skipped=2000)
         base.update(overrides)
         b.validate_args(Namespace(**base))
 
@@ -436,6 +438,125 @@ class ChunkFolderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._validate_args(parquet_chunk_glob="v1.2.0/{shard}/*.parquet")
 
+
+class RandomSampleTests(unittest.TestCase):
+    """Random-sample mode: valid rows only, no repeats, abandon past the rejection limit."""
+
+    GOOD = "a red square on a white background"
+    BAD = "bad caption"  # rejected by the validator below
+
+    def validate(self, row):
+        if row.get("image") is None:
+            return False, "no_image"
+        if row["caption"].startswith("bad"):
+            return False, "bad_caption"
+        return True, None
+
+    def _layout(self):
+        # file0: group0 rows 0-4 (rows 3-4 bad), group1 rows 5-6 good; file1: rows 7-9 (row 9 bad)
+        def row(i, bad):
+            return (self.BAD if bad else self.GOOD, png_bytes((i, i, i)))
+        return [
+            [[row(0, 0), row(1, 0), row(2, 0), row(3, 1), row(4, 1)], [row(5, 0), row(6, 0)]],
+            [[row(7, 0), row(8, 0), row(9, 1)]],
+        ]
+
+    def _source(self, paths, target, max_skipped, seed=0, fetch=None):
+        from ray_image.parquet_source import RandomSampleSource
+        names = [os.path.basename(p) for p in paths]
+        by_name = dict(zip(names, paths))
+        return RandomSampleSource("local/test", names, ["image", "caption", "row_id"], "image",
+                                  validate=self.validate, target=target, max_skipped=max_skipped, seed=seed,
+                                  fetch_file=fetch or (lambda n: by_name[n]), sleep=lambda s: None,
+                                  log=lambda *a, **k: None)
+
+    def test_yields_exactly_target_valid_unique_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = make_files(d, self._layout())
+            for seed in range(5):
+                src = self._source(paths, target=5, max_skipped=100, seed=seed)
+                rows = list(src)
+                self.assertEqual(len(rows), 5)
+                self.assertEqual(len({r["row_id"] for r in rows}), 5)
+                self.assertTrue(all(r["caption"] == self.GOOD for r in rows))
+                self.assertLessEqual(src.skipped_rows, 3)
+
+    def test_running_out_of_rows_ends_iteration(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = make_files(d, self._layout())
+            src = self._source(paths, target=50, max_skipped=100)
+            rows = list(src)
+            self.assertEqual(sorted(r["row_id"] for r in rows), [0, 1, 2, 5, 6, 7, 8])  # all good rows
+
+    def test_abandons_past_the_rejection_limit(self):
+        from ray_image.parquet_source import ChunkAbandoned
+        layout = [[[(self.BAD, png_bytes((i, 0, 0))) for i in range(10)]]]
+        with tempfile.TemporaryDirectory() as d:
+            paths = make_files(d, layout)
+            src = self._source(paths, target=1, max_skipped=2)
+            with self.assertRaises(ChunkAbandoned):
+                next(src)
+            self.assertEqual(src.skipped_rows, 3)
+            self.assertEqual(src.reject_reasons["bad_caption"], 3)
+
+    def test_unreadable_row_group_is_rejected_not_yielded(self):
+        layout = [[[(self.GOOD, png_bytes((i, 0, 0))) for i in range(3)],
+                   [(self.GOOD, png_bytes((i, 1, 0))) for i in (3, 4)]],
+                  [[(self.GOOD, png_bytes((i, 2, 0))) for i in (5, 6, 7)]]]
+        with tempfile.TemporaryDirectory() as d:
+            paths = make_files(d, layout)
+            real = pq.ParquetFile
+            target_path = os.path.abspath(paths[0])
+
+            class Targeted(real):
+                def __init__(self, path, *a, **k):
+                    super().__init__(path, *a, **k)
+                    self._bad = os.path.abspath(str(path)) == target_path
+
+                def read_row_group(self, rg, *a, **k):
+                    if self._bad and rg == 1:
+                        raise OSError("simulated corrupt page")
+                    return super().read_row_group(rg, *a, **k)
+
+            with mock.patch.object(ps.pq, "ParquetFile", Targeted):
+                src = self._source(paths, target=8, max_skipped=10)
+                rows = list(src)
+            self.assertNotIn(3, [r["row_id"] for r in rows])
+            self.assertNotIn(4, [r["row_id"] for r in rows])
+            self.assertEqual(src.reject_reasons["read_error"], 2)
+            self.assertEqual(len(rows), 6)  # 8 rows total minus the 2 in the broken group
+
+    def test_chunk_files_are_disjoint_and_deterministic(self):
+        from ray_image.parquet_source import random_chunk_files
+        all_files = [f"v1.2.0/cc12m/{g}-0/{f:06d}.parquet" for g in range(20) for f in range(8)] + \
+            ["v1.2.0/other/0.parquet", "README.md"]
+        pattern = "v1.2.0/cc12m/*.parquet"
+        slices = [random_chunk_files(all_files, pattern, seed=7, index=i, files_per_chunk=8) for i in range(20)]
+        flat = [f for s_ in slices for f in s_]
+        self.assertEqual(len(flat), len(set(flat)))  # no file in two chunks
+        self.assertTrue(all(f.startswith("v1.2.0/cc12m/") for f in flat))
+        self.assertEqual(slices[3], random_chunk_files(all_files, pattern, seed=7, index=3, files_per_chunk=8))
+        self.assertNotEqual(slices[0], random_chunk_files(all_files, pattern, seed=8, index=0, files_per_chunk=8))
+        with self.assertRaises(RuntimeError):
+            random_chunk_files(all_files, pattern, seed=7, index=20, files_per_chunk=8)
+
+    def test_validator_reasons(self):
+        from ray_image import build_cache_v5 as b
+        args = Namespace(image_column="image", caption_column="caption", caption_template=None)
+        validate = b.make_validator(args)
+        self.assertEqual(validate({"image": None, "caption": "a long enough caption here"}), (False, "no_image"))
+        self.assertEqual(validate({"image": object(), "caption": "  "}), (False, "empty_caption"))
+        self.assertEqual(validate({"image": object(), "caption": "too short"}), (False, "caption_dropped"))
+        self.assertEqual(validate({"image": object(), "caption": "a long enough caption here"}), (True, None))
+
+    def test_random_mode_argument_checks(self):
+        ChunkFolderTests._validate_args(self, random_sample=True, parquet_chunk_glob="", source_offset=0)
+        with self.assertRaises(ValueError):
+            ChunkFolderTests._validate_args(self, random_sample=True, random_sample_files=0)
+        with self.assertRaises(ValueError):
+            ChunkFolderTests._validate_args(self, random_sample=True, max_skipped=-1)
+        with self.assertRaises(ValueError):
+            ChunkFolderTests._validate_args(self, random_sample=True, source_format="datasets")
 
 class SourceColumnsTests(unittest.TestCase):
     def test_columns_include_only_needed_fields(self):
