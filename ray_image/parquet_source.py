@@ -14,13 +14,15 @@ Failure policy:
 - A row whose image bytes cannot be decoded is yielded as a dict with image=None, so build_chunk
   counts it as a skip and keeps going.
 
-Files are read in sorted filename order. This matches the streaming order of the dataset only if
-the Hub's file order is the dataset row order (not verified for every dataset; check the probe).
+The source only ever sees the files it is given. build_cache_v5 gives it the files of one chunk
+(for example every 000000..000007 file in folder 14-0), so the footer pass touches a few files, not
+the whole dataset. Files are ordered by natural sort (2-0 before 10-0, 000002 before 000010).
 """
 
 import bisect
 import fnmatch
 import io
+import re
 import time
 
 import pyarrow.parquet as pq
@@ -38,14 +40,23 @@ class FailedRow:
         self.error = error
 
 
-def list_parquet_files(repo_id: str, pattern: str, token=None) -> list:
-    """Sorted list of repo paths that match the glob, e.g. 'data/*.parquet'."""
+def list_repo_files(repo_id: str, token=None) -> list:
+    """All file paths in a dataset repo (one API call, no downloads)."""
     from huggingface_hub import HfApi
 
-    files = HfApi(token=token).list_repo_files(repo_id=repo_id, repo_type="dataset")
-    matched = sorted(f for f in files if fnmatch.fnmatch(f, pattern))
+    return HfApi(token=token).list_repo_files(repo_id=repo_id, repo_type="dataset")
+
+
+def natural_key(path: str):
+    """Sort key that orders digit runs by value: 'x/2-0' < 'x/10-0', '000002' < '000010'."""
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path)]
+
+
+def chunk_files(all_files, pattern: str) -> list:
+    """Repo paths matching the glob, in natural order. Raises if nothing matches."""
+    matched = sorted((f for f in all_files if fnmatch.fnmatch(f, pattern)), key=natural_key)
     if not matched:
-        raise RuntimeError(f"no files in {repo_id} match {pattern!r}")
+        raise RuntimeError(f"no files match {pattern!r}")
     return matched
 
 

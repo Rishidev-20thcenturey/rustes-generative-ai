@@ -369,6 +369,74 @@ class SharedFailedRowTests(unittest.TestCase):
         from ray_image import build_cache_v5 as b
         self.assertIs(b.FailedRow, ps.FailedRow)
 
+class ChunkFolderTests(unittest.TestCase):
+    def test_natural_order_and_glob(self):
+        from ray_image.parquet_source import chunk_files, natural_key
+        names = ["v/cc12m/10-0/000000.parquet", "v/cc12m/2-0/000000.parquet",
+                 "v/cc12m/14-0/000010.parquet", "v/cc12m/14-0/000002.parquet",
+                 "v/cc12m/14-0/000001.parquet", "v/cc12m/14-1/000000.parquet",
+                 "v/cc12m/1-0/000000.parquet", "README.md"]
+        self.assertEqual(
+            chunk_files(names, "v/cc12m/14-0/*.parquet"),
+            ["v/cc12m/14-0/000001.parquet", "v/cc12m/14-0/000002.parquet", "v/cc12m/14-0/000010.parquet"])
+        self.assertEqual(sorted(names, key=natural_key)[:3],
+                         ["README.md", "v/cc12m/1-0/000000.parquet", "v/cc12m/2-0/000000.parquet"])
+        with self.assertRaises(RuntimeError):
+            chunk_files(names, "v/cc12m/99-0/*.parquet")
+
+    def _chunk_args(self, chunk_size):
+        return Namespace(dataset_name="local/test", parquet_chunk_glob="folder/{chunk}-0/*.parquet",
+                         image_column="image", caption_column="caption", caption_template=None,
+                         chunk_size=chunk_size)
+
+    def _folder(self, d, rows, chunk=0):
+        """Write one folder 'folder/<chunk>-0/' with files of the given row counts."""
+        paths, mapping = [], {}
+        for f_index, n in enumerate(rows):
+            name = f"folder/{chunk}-0/{f_index:06d}.parquet"
+            path = os.path.join(d, f"{f_index}.parquet")
+            table = pa.table({
+                "image": pa.array([{"bytes": png_bytes((1, 1, 1)), "path": None}] * n,
+                                  type=pa.struct([("bytes", pa.binary()), ("path", pa.string())])),
+                "caption": pa.array(["a caption with enough words here"] * n, type=pa.string()),
+            })
+            pq.write_table(table, path)
+            paths.append(name)
+            mapping[name] = path
+        return paths, mapping
+
+    def test_chunk_source_checks_row_count(self):
+        from ray_image import build_cache_v5 as b
+        with tempfile.TemporaryDirectory() as d:
+            names, mapping = self._folder(d, [3, 2], chunk=0)  # 5 rows in total
+            args = self._chunk_args(chunk_size=5)
+            with mock.patch.object(ps.ParquetRowSource, "_download", lambda self, p: mapping[p]):
+                src = b.make_chunk_source(args, 0, names, log=lambda *a, **k: None)
+                self.assertEqual(src.total_rows, 5)
+                args.chunk_size = 6
+                with self.assertRaises(RuntimeError) as ctx:
+                    b.make_chunk_source(args, 0, names, log=lambda *a, **k: None)
+                self.assertIn("folder-to-chunk mapping", str(ctx.exception))
+
+    def _validate_args(self, **overrides):
+        from ray_image import build_cache_v5 as b
+        base = dict(caption_template=None, source_offset=0, start_chunk=14, end_chunk=15, chunk_size=10_000,
+                    dataset_name="jasperai/monet", batch_size=8, source_format="parquet",
+                    parquet_chunk_glob="v1.2.0/cc12m/{chunk}-0/*.parquet", probe_rows=0,
+                    heartbeat_s=60.0, stall_s=300.0, no_hf_upload=False, hf_repo="x/y", image_split="train")
+        base.update(overrides)
+        b.validate_args(Namespace(**base))
+
+    def test_validate_parquet_arguments(self):
+        self._validate_args()  # the intended launch shape is accepted
+        with self.assertRaises(ValueError):
+            self._validate_args(parquet_chunk_glob="v1.2.0/cc12m/**/*.parquet")  # no {chunk}: the old OOM case
+        with self.assertRaises(ValueError):
+            self._validate_args(source_offset=140000)
+        with self.assertRaises(ValueError):
+            self._validate_args(parquet_chunk_glob="v1.2.0/{shard}/*.parquet")
+
+
 class SourceColumnsTests(unittest.TestCase):
     def test_columns_include_only_needed_fields(self):
         from ray_image import build_cache_v5 as b

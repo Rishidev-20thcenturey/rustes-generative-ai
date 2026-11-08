@@ -16,7 +16,11 @@ Behaviour:
   re-encoding. Only the source rows are skipped.
 - Disk auto-purge: after a chunk is uploaded, its local .pt is deleted, all dataset caches
   (datasets--*) are removed, and *.incomplete files are deleted. The models--* folders (Qwen, VAE)
-  are kept, so they are not re-downloaded. Without an upload (--no-hf-upload) nothing is deleted.
+  are kept, so they are not re-downloaded. Without an upload (--no-hf-upload) nothing is deleted
+  in datasets mode.
+- Parquet mode (--source-format parquet --parquet-chunk-glob 'repo/path/{chunk}-0/*.parquet'): each
+  chunk reads only its own folder. The folder must hold exactly --chunk-size rows. The dataset
+  cache is purged after every chunk attempt, so the disk holds at most one chunk's files.
 
 Run as a module from the repo root:
   python -m ray_image.build_cache_v5 --dataset-name huggan/wikiart --image-split train \\
@@ -39,7 +43,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi, constants, create_repo, hf_hub_download
 from PIL import Image
 
-from .parquet_source import FailedRow, ParquetRowSource, list_parquet_files
+from .parquet_source import FailedRow, ParquetRowSource, chunk_files, list_repo_files
 from .text_encoder import RAYTextEncoder
 from .vae_v3 import IMAGE_SIZE, LATENT_SIZE, RAYVAE_v3
 
@@ -505,8 +509,15 @@ def validate_args(args) -> None:
         raise ValueError("--chunk-size must be a positive multiple of 1000 (chunk file names use thousands)")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
-    if args.source_format == "parquet" and not args.parquet_glob.strip():
-        raise ValueError("--parquet-glob is required with --source-format parquet")
+    if args.source_format == "parquet":
+        if "{chunk}" not in args.parquet_chunk_glob:
+            raise ValueError("--parquet-chunk-glob must contain {chunk}, e.g. 'v1.2.0/cc12m/{chunk}-0/*.parquet'")
+        try:
+            args.parquet_chunk_glob.format(chunk=0)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(f"--parquet-chunk-glob may only use the {{chunk}} field: {exc}")
+        if args.source_offset != 0:
+            raise ValueError("--source-offset must be 0 with --source-format parquet: each chunk reads its own folder")
     if args.probe_rows < 0:
         raise ValueError("--probe-rows must be >= 0")
     if args.heartbeat_s <= 0 or args.stall_s <= 0:
@@ -527,28 +538,36 @@ def source_columns(args) -> list:
     return sorted({args.image_column} | caption_fields)
 
 
-def make_source(args, start_position: int, log=print):
-    """Row source for the build. Returns a SafeIterator (datasets) or ParquetRowSource (parquet)."""
-    if args.source_format == "parquet":
-        token = os.getenv("HF_TOKEN")
-        files = list_parquet_files(args.dataset_name, args.parquet_glob, token=token)
-        print(f"[parquet] {len(files)} file(s) match {args.parquet_glob!r} in {args.dataset_name}: "
-              f"{files[0]} .. {files[-1]}", flush=True)
-        t0 = time.monotonic()
-        source = ParquetRowSource(args.dataset_name, files, source_columns(args), args.image_column,
-                                  start=start_position, log=log, token=token)
-        print(f"[parquet] indexed {source.total_rows:,} rows in {len(files)} files "
-              f"({time.monotonic() - t0:.1f}s, footer pass; each file is downloaded once here)", flush=True)
-        if start_position > source.total_rows:
-            raise SystemExit(f"[stop] start row {start_position:,} is past the end of the dataset "
-                             f"({source.total_rows:,} rows)")
-        return source
+def make_datasets_source(args, start_position: int, log=print):
+    """Row source for --source-format datasets: a SafeIterator over the streaming dataset."""
 
     def open_at(position: int):
         return load_dataset(args.dataset_name, args.dataset_config, split=args.image_split,
                             streaming=True).skip(position)
 
     return SafeIterator(open_at, start=start_position, log=log)
+
+
+def make_chunk_source(args, index: int, all_files: list, log=print):
+    """Row source for one chunk in parquet mode: exactly the files of that chunk's folder.
+
+    Reads only the footers of those files (the files are downloaded to the local HF cache, which is
+    purged after the chunk). The folder must hold exactly chunk_size rows, so a wrong folder-to-chunk
+    mapping stops the build before any encoding.
+    """
+    pattern = args.parquet_chunk_glob.format(chunk=index)
+    files = chunk_files(all_files, pattern)
+    print(f"[parquet] chunk {index}: {len(files)} file(s) match {pattern!r}: "
+          f"{files[0]} .. {files[-1]}", flush=True)
+    t0 = time.monotonic()
+    source = ParquetRowSource(args.dataset_name, files, source_columns(args), args.image_column,
+                              start=0, log=log, token=os.getenv("HF_TOKEN"))
+    print(f"[parquet] chunk {index}: {source.total_rows:,} rows ({time.monotonic() - t0:.1f}s)", flush=True)
+    if source.total_rows != args.chunk_size:
+        raise RuntimeError(
+            f"chunk {index}: {pattern!r} has {source.total_rows:,} rows, expected {args.chunk_size:,}; "
+            f"the folder-to-chunk mapping is wrong for this dataset")
+    return source
 
 
 def run_probe(args, source, heartbeat) -> bool:
@@ -647,8 +666,10 @@ def main() -> None:
     parser.add_argument("--source-format", choices=["datasets", "parquet"], default="datasets",
                         help="datasets: HF datasets streaming (default). parquet: read the Parquet files "
                              "directly, one row group at a time (see parquet_source.py).")
-    parser.add_argument("--parquet-glob", type=str, default="data/*.parquet",
-                        help="with --source-format parquet: repo file pattern, sorted to give the row order")
+    parser.add_argument("--parquet-chunk-glob", type=str, default="",
+                        help="with --source-format parquet: repo file pattern for ONE chunk, with {chunk} "
+                             "replaced by the chunk index, e.g. 'v1.2.0/cc12m/{chunk}-0/*.parquet'. "
+                             "Each chunk reads only its own files; the folder must hold exactly --chunk-size rows.")
     parser.add_argument("--probe-rows", type=int, default=0,
                         help="read this many source rows on the CPU (no models, no upload) and report, then exit")
     parser.add_argument("--heartbeat-s", type=float, default=60.0, help="progress line interval, seconds")
@@ -656,16 +677,22 @@ def main() -> None:
                         help="print [stall] after this many seconds with no source row")
     args = parser.parse_args()
     if args.probe_rows > 0:
-        args.no_hf_upload = True  # the probe never uploads or deletes anything
+        args.no_hf_upload = True  # the probe never uploads (parquet mode only clears the dataset download cache)
     validate_args(args)
 
     if args.probe_rows > 0:
-        source = make_source(args, args.start_chunk * args.chunk_size - args.source_offset)
         heartbeat = Heartbeat(args.heartbeat_s, args.stall_s).start()
         try:
+            if args.source_format == "parquet":
+                all_files = list_repo_files(args.dataset_name, token=os.getenv("HF_TOKEN"))
+                source = make_chunk_source(args, args.start_chunk, all_files)
+            else:
+                source = make_datasets_source(args, args.start_chunk * args.chunk_size - args.source_offset)
             passed = run_probe(args, source, heartbeat)
         finally:
             heartbeat.stop()
+            if args.source_format == "parquet":
+                purge_hf_hub_cache()
         raise SystemExit(0 if passed else 2)
 
     device = torch.device(args.device)
@@ -692,7 +719,13 @@ def main() -> None:
                                   load_in_8bit=True).eval()
 
     offset = args.source_offset
-    source = make_source(args, args.start_chunk * args.chunk_size - offset)
+    parquet_mode = args.source_format == "parquet"
+    all_files = []
+    source = None
+    if parquet_mode:
+        all_files = list_repo_files(args.dataset_name, token=hf_token)
+    else:
+        source = make_datasets_source(args, args.start_chunk * args.chunk_size - offset)
     heartbeat = Heartbeat(args.heartbeat_s, args.stall_s).start()
     print(f"[window] dataset={args.dataset_name}:{args.image_split} chunks {args.start_chunk}.."
           f"{args.end_chunk - 1} (global rows {args.start_chunk * args.chunk_size:,}.."
@@ -706,13 +739,15 @@ def main() -> None:
         end = start + args.chunk_size
         filename = chunk_filename(start, end)
         local_path = output_dir / filename
-        source.skip_to(start - offset)
+        if not parquet_mode:
+            source.skip_to(start - offset)
 
         if filename in existing_hf and not args.no_hf_upload:
             print(f"[resume] HF already has {filename}; skipping chunk {index}")
             if local_path.exists():
                 local_path.unlink()
-            source.skip_to(end - offset)
+            if not parquet_mode:
+                source.skip_to(end - offset)
             completed += 1
             continue
 
@@ -721,6 +756,8 @@ def main() -> None:
         else:
             print(f"[build] chunk {index}: source rows {start}:{end}")
             try:
+                if parquet_mode:
+                    source = make_chunk_source(args, index, all_files)
                 payload = build_chunk(source, args.chunk_size, vae, text_encoder, device, args.batch_size,
                                       args.image_column, args.caption_column, args.dataset_name, start, end,
                                       caption_template=args.caption_template, heartbeat=heartbeat)
@@ -730,6 +767,11 @@ def main() -> None:
             except Exception:
                 print(f"[error] chunk {index} failed; rerun with the same arguments to retry it")
                 raise
+            finally:
+                if parquet_mode:
+                    # Chunk files are only needed while this chunk is read; free the disk now.
+                    source = None
+                    purge_hf_hub_cache()
             save_chunk_atomic(payload, local_path)
             del payload
 
