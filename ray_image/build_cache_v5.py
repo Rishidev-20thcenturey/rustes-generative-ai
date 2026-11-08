@@ -861,7 +861,9 @@ def main() -> None:
           f"source retries={source.retries} skipped source rows={source.skipped_rows} "
           f"stalls={heartbeat.stall_count}")
     if abandoned:
-        print(f"[warn] abandoned chunks (no file written; rerun with another --seed to retry): {abandoned}")
+        print(f"[warn] abandoned chunks (no file written): {abandoned}. A rerun with the same settings "
+              f"abandons them again (same files, same row order). Changing --seed reshuffles every chunk "
+              f"and can duplicate rows already built; do not do that mid-run.")
 
 
 if __name__ == "__main__":
