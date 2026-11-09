@@ -558,6 +558,49 @@ class RandomSampleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ChunkFolderTests._validate_args(self, random_sample=True, source_format="datasets")
 
+class MainSummaryTests(unittest.TestCase):
+    """Regression: the run must finish cleanly in parquet mode (it used to crash on source.retries)."""
+
+    def test_parquet_run_prints_done_summary(self):
+        import io
+        from contextlib import redirect_stdout
+        from ray_image import build_cache_v5 as b
+
+        with tempfile.TemporaryDirectory() as d:
+            rows = [("a red square on a white background", png_bytes((1, 1, 1)))] * 2000
+            # 4 files x 500 rows: chunk 0 draws 2 files, chunk 1 the other 2 (1000 rows each)
+            names = [f"v1.2.0/cc12m/{g}-0/000000.parquet" for g in range(4)]
+            paths = make_files(d, [[rows[i * 500:(i + 1) * 500]] for i in range(4)])
+            mapping = dict(zip(names, paths))
+
+            def fake_build_chunk(source, n_rows, *a, **k):
+                for _ in range(n_rows):
+                    next(source)
+                return {"samples_cached": n_rows}
+
+            argv = ["build", "--source-format", "parquet", "--random-sample", "--random-sample-files", "2",
+                    "--dataset-name", "jasperai/monet", "--image-column", "image", "--caption-column", "caption",
+                    "--start-chunk", "0", "--end-chunk", "2", "--chunk-size", "1000",
+                    "--no-hf-upload", "--device", "cpu", "--output-dir", d]
+            out = io.StringIO()
+            with mock.patch.object(b, "list_repo_files", lambda repo, token=None: names), \
+                    mock.patch.object(ps.ParquetRowSource, "_download", lambda self, p: mapping[p]), \
+                    mock.patch.object(b, "purge_hf_hub_cache", lambda *a, **k: 0), \
+                    mock.patch.object(b, "load_vae", lambda device: object()), \
+                    mock.patch.object(b, "RAYTextEncoder", mock.MagicMock()), \
+                    mock.patch.object(b, "HfApi", mock.MagicMock()), \
+                    mock.patch.object(b, "build_chunk", fake_build_chunk), \
+                    mock.patch.object(b, "save_chunk_atomic", lambda payload, path: None), \
+                    mock.patch.object(b.torch, "manual_seed", lambda seed: None, create=True), \
+                    mock.patch.object(b.torch, "device", lambda name: types.SimpleNamespace(type=name), create=True), \
+                    mock.patch.object(sys, "argv", argv), \
+                    redirect_stdout(out):
+                b.main()  # must not raise
+            text = out.getvalue()
+            self.assertIn("[done] completed 2/2 chunks", text)
+            self.assertIn("source retries=", text)
+
+
 class SourceColumnsTests(unittest.TestCase):
     def test_columns_include_only_needed_fields(self):
         from ray_image import build_cache_v5 as b

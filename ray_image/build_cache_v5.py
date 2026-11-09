@@ -802,6 +802,8 @@ def main() -> None:
 
     completed = 0
     abandoned = []
+    # Retry/skip counts from parquet sources that were already closed (source is reset per chunk).
+    closed_source_stats = {"retries": 0, "skipped": 0}
     for index in range(args.start_chunk, args.end_chunk):
         start = index * args.chunk_size
         end = start + args.chunk_size
@@ -842,6 +844,9 @@ def main() -> None:
             finally:
                 if parquet_mode:
                     # Chunk files are only needed while this chunk is read; free the disk now.
+                    if source is not None:
+                        closed_source_stats["retries"] += source.retries
+                        closed_source_stats["skipped"] += source.skipped_rows
                     source = None
                     purge_hf_hub_cache()
             save_chunk_atomic(payload, local_path)
@@ -857,8 +862,10 @@ def main() -> None:
         completed += 1
 
     heartbeat.stop()
+    retries_total = closed_source_stats["retries"] + (source.retries if source is not None else 0)
+    skipped_total = closed_source_stats["skipped"] + (source.skipped_rows if source is not None else 0)
     print(f"[done] completed {completed}/{args.end_chunk - args.start_chunk} chunks; "
-          f"source retries={source.retries} skipped source rows={source.skipped_rows} "
+          f"source retries={retries_total} skipped source rows={skipped_total} "
           f"stalls={heartbeat.stall_count}")
     if abandoned:
         print(f"[warn] abandoned chunks (no file written): {abandoned}. A rerun with the same settings "
