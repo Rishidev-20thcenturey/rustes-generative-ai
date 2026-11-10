@@ -15,6 +15,10 @@ import re
 import subprocess
 import sys
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import hf_rest  # noqa: E402  plain-HTTP downloads; see hf_rest.py
+
 REPO = "/kaggle/working/ray-image-v1"
 MODEL_REPO = "Rishix500/ray-image-dit-v5-moe"
 CACHE_REPO_1 = "Rishix500/monet-qwen-cache-200k-v4"    # chunks 0-24: starts 0k..240k
@@ -90,7 +94,7 @@ def main():
     run(["pip", "install", "-q", "datasets==3.6.0", "transformers==4.51.3",
          "huggingface-hub>=0.30.0,<1.0", "torchvision", "lpips", "bitsandbytes", "accelerate"])
 
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi
     from kaggle_secrets import UserSecretsClient
 
     # 2. Token. Kaggle secret, not a value in this file.
@@ -127,13 +131,14 @@ def main():
         return
     os.makedirs(CKPT_DIR, exist_ok=True)
     print(f"[resume] downloading {filename} (step {step})", flush=True)
-    ckpt_path = hf_hub_download(repo_id=MODEL_REPO, filename=filename, local_dir=CKPT_DIR, token=token)
+    ckpt_path = hf_rest.hf_hub_download(repo_id=MODEL_REPO, filename=filename, repo_type="model",
+                                        token=token, local_dir=CKPT_DIR)
     print("[resume] checkpoint ready", flush=True)
 
     # 6. Train. Baseline: no --use-sage, no --use-sim-loss.
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     cmd = [
-        sys.executable, "-u", "-m", "ray_image.train_dit_v5",
+        sys.executable, "-u", os.path.join(HERE, "train_wrapper.py"),
         "--resume", ckpt_path,
         "--steps", str(TARGET_STEPS),
         "--batch-size", "4",
