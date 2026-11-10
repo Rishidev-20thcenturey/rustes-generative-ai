@@ -9,7 +9,9 @@ import unittest
 import hf_rest
 
 PAYLOAD = b"x" * 100_000
+BIG = bytes(range(256)) * 4000          # 1,024,000 bytes, distinct content to check offsets
 SEEN_AUTH = []
+STATE = {"dropped": False, "range_requests": 0}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -28,6 +30,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = PAYLOAD
         elif self.path == "/datasets/Rishix500/data/resolve/main/chunk.pt":
             body = b"chunk-bytes"
+        elif self.path == "/Rishix500/demo/resolve/main/big.pt":
+            rng = self.headers.get("Range")
+            if rng:
+                STATE["range_requests"] += 1
+                start = int(rng.split("=", 1)[1].rstrip("-"))
+                part = BIG[start:]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{len(BIG) - 1}/{len(BIG)}")
+                self.send_header("Content-Length", str(len(part)))
+                self.end_headers()
+                self.wfile.write(part)
+                return
+            if not STATE["dropped"]:
+                # First full request: promise everything, send 300,000 bytes, then close.
+                STATE["dropped"] = True
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(BIG)))
+                self.end_headers()
+                self.wfile.write(BIG[:300_000])
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            body = BIG
+        elif self.path == "/Rishix500/demo/resolve/main/ignore.pt":
+            body = BIG  # always a full 200, even when Range is sent
         else:
             self.send_response(404)
             self.end_headers()
@@ -99,6 +126,32 @@ class HfRestTests(unittest.TestCase):
                                         repo_type="model", local_dir=d)
             self.assertFalse(os.path.exists(os.path.join(d, "nope.pt")))
             self.assertFalse(os.path.exists(os.path.join(d, "nope.pt.part")))
+
+    def test_dropped_connection_resumes_with_range(self):
+        STATE["dropped"] = False
+        STATE["range_requests"] = 0
+        old_chunk = hf_rest.CHUNK_BYTES
+        hf_rest.CHUNK_BYTES = 65536  # small blocks, so the 300,000-byte drop leaves saved bytes
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = hf_rest.hf_hub_download(repo_id="Rishix500/demo", filename="big.pt",
+                                               repo_type="model", local_dir=d)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), BIG)
+                self.assertGreaterEqual(STATE["range_requests"], 1)
+                self.assertFalse(os.path.exists(path + ".part"))
+        finally:
+            hf_rest.CHUNK_BYTES = old_chunk
+
+    def test_server_ignoring_range_restarts_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            part = os.path.join(d, "ignore.pt.part")
+            with open(part, "wb") as f:
+                f.write(b"junk-from-an-old-attempt")
+            path = hf_rest.hf_hub_download(repo_id="Rishix500/demo", filename="ignore.pt",
+                                           repo_type="model", local_dir=d)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), BIG)
 
     def test_list_repo_files_returns_files_only(self):
         files = hf_rest.list_repo_files("Rishix500/demo", repo_type="model", token="hf_test")
