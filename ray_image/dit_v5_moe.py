@@ -100,6 +100,12 @@ class MoELayer(nn.Module):
             [SwiGLU(dim, expert_hidden_dim) for _ in range(num_shared_experts)]
         )
         self.last_dropped_fraction = 0.0
+        # Off by default. When on (set by RAYDiT_v5.forward(capture=True)), forward() keeps the
+        # router probabilities, the top-k expert indices and the MoE output for the regularisers.
+        self.record_routing = False
+        self.last_probs = None
+        self.last_top_idx = None
+        self.last_out = None
 
     def forward(self, x: torch.Tensor):
         b, t, d = x.shape
@@ -139,7 +145,63 @@ class MoELayer(nn.Module):
             out.index_add_(0, tokens, h.float() * flat_weight[idx, None])
         for shared in self.shared_experts:
             out = out + shared(flat).float()
+        if self.record_routing:
+            self.last_probs = probs
+            self.last_top_idx = top_idx.detach()
+            self.last_out = out
         return out.to(x.dtype).view(b, t, d), lb_loss, router_z_loss
+
+
+def router_similarity_loss(probs: torch.Tensor, top_idx: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Router similarity loss (Expert Race, arXiv 2503.16057, Sec. 5.2). Flag-gated, off by default.
+
+    probs:   [n, E] softmax router probabilities (differentiable).
+    top_idx: [n, k] selected expert indices (hard, no gradient).
+    M is the hard indicator of the selection. P' = P^T P, M' = M^T M, and
+    L = (1/n) * sum_ij W(i,j) * P'(i,j). W is built from M' (no gradient):
+      diagonal:     M'_ii / (E * sum_i M'_ii)
+      off-diagonal: M'_ij / ((E^2 - E) * sum_{i!=j} M'_ij)
+    The off-diagonal terms are penalised by how often two experts are picked together.
+    """
+    n, e = probs.shape
+    m = torch.zeros(n, e, device=probs.device, dtype=probs.dtype)
+    m.scatter_(1, top_idx, 1.0)
+    with torch.no_grad():
+        m_pair = m.t() @ m
+        diag_mask = torch.eye(e, device=probs.device, dtype=torch.bool)
+        diag_sum = m_pair.masked_select(diag_mask).sum().clamp_min(1e-6)
+        off_sum = m_pair.masked_select(~diag_mask).sum().clamp_min(1e-6)
+        weight = torch.where(
+            diag_mask,
+            m_pair / (diag_sum * e),
+            m_pair / (off_sum * (e * e - e)),
+        )
+    p_pair = probs.t() @ probs
+    return (weight * p_pair).sum() / n
+
+
+def sage_loss(f_c: torch.Tensor, f_u: torch.Tensor, k_split: int = 2) -> torch.Tensor:
+    """SAGE subspace-alignment loss (arXiv 2609.34525, Eq. 9 and Algorithm 1). Flag-gated.
+
+    f_c, f_u: [n, d] MoE outputs for the conditional and the paired unconditional pass
+    (n = B*T tokens). Rows are tokens, so the paper's F (d x n) is the transpose here.
+    A column subset of size m = min(n, floor(d / k_split)) is taken from the stop-gradient
+    conditional output. Its thin QR gives an orthonormal basis Q. The loss is
+    ||F_u - Q Q^T F_u||_F^2 / ||F_u||_F^2. Gradients flow through f_u only.
+    """
+    n, d = f_u.shape
+    m = min(n, d // max(1, k_split))
+    if m < 1:
+        raise ValueError("sage_loss needs at least one token and a non-zero split")
+    fc = f_c.detach().float()
+    fu = f_u.float()
+    idx = torch.randperm(n, device=fc.device)[:m]
+    with torch.no_grad():
+        q, _ = torch.linalg.qr(fc[idx].t(), mode="reduced")  # [d, m], orthonormal columns
+    proj = (fu @ q) @ q.t()
+    residual = fu - proj
+    denom = fu.pow(2).sum().clamp_min(1e-8)
+    return residual.pow(2).sum() / denom
 
 
 class RAYDiTBlock_v5(nn.Module):
@@ -239,12 +301,15 @@ class RAYDiT_v5(nn.Module):
         text_mask: torch.Tensor | None = None,
         checkpoint_blocks: bool = False,
         return_losses: bool = True,
+        capture: bool = False,
     ):
         """Training forward. Returns (prediction, load_balancing_loss, router_z_loss) by default.
 
         return_losses=False returns only the prediction tensor, the same shape as v4's forward.
         Use predict_velocity() for inference rather than passing this flag by hand.
         checkpoint_blocks=True recomputes each block in the backward pass (training only).
+        capture=True stores, per layer, (router probs, top-k indices, MoE output) in
+        self.last_captures for the SAGE and router-similarity regularisers. Default off.
         """
         if z.ndim != 4:
             raise ValueError(f"expected latent tensor [B,C,H,W], got {tuple(z.shape)}")
@@ -274,6 +339,9 @@ class RAYDiT_v5(nn.Module):
         text_ctx = self.text_ctx_proj(text)
         lb_total = x.new_zeros((), dtype=torch.float32)
         z_total = x.new_zeros((), dtype=torch.float32)
+        if capture:
+            for block in self.blocks:
+                block.moe.record_routing = True
         for block in self.blocks:
             if checkpoint_blocks and self.training:
                 x, lb, zl = checkpoint(_run_block, block, x, cond, text_ctx, text_mask, use_reentrant=False)
@@ -281,6 +349,13 @@ class RAYDiT_v5(nn.Module):
                 x, lb, zl = block(x, cond, text_ctx, text_mask=text_mask)
             lb_total = lb_total + lb
             z_total = z_total + zl
+        if capture:
+            self.last_captures = []
+            for block in self.blocks:
+                moe = block.moe
+                self.last_captures.append((moe.last_probs, moe.last_top_idx, moe.last_out))
+                moe.record_routing = False
+                moe.last_probs = moe.last_top_idx = moe.last_out = None
 
         x = self.out(self.norm(x))
         x = x.view(b, ph, pw, self.patch, self.patch, self.latent_channels)

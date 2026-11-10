@@ -45,6 +45,8 @@ from .dit_v5_moe import (
     MOE_TOP_K,
     RAYDiT_v5,
     WARM_START_DOWN_SCALE,
+    router_similarity_loss,
+    sage_loss,
     warm_start_from_v4,
 )
 from .train_dit_v4 import (
@@ -145,6 +147,11 @@ def build_config(args) -> dict:
         "capacity_factor": args.capacity_factor,
         "aux_loss_weight": args.aux_loss_weight,
         "z_loss_weight": args.z_loss_weight,
+        "use_sage": bool(args.use_sage),
+        "sage_k_split": args.sage_k_split,
+        "sage_weight": args.sage_weight,
+        "use_sim_loss": bool(args.use_sim_loss),
+        "sim_loss_weight": args.sim_loss_weight,
         # RB-03: provenance so a later run (or generate.py) can tell exactly what this was trained on.
         "latent_space": LATENT_SPACE,
         "vae_checkpoint": VAE_CHECKPOINT,
@@ -179,12 +186,41 @@ def train_step(dit, ema, optimizer, scaler, batch, null_emb_full, null_mask_full
     z_t = (1.0 - t_view) * clean_latents + t_view * noise
     target_velocity = noise - clean_latents
     optimizer.zero_grad(set_to_none=True)
+    # SAGE and the router similarity loss read the per-layer routing captures. Both are off by default,
+    # so the baseline run does the same forward as before.
+    capture = bool(args.use_sage or args.use_sim_loss)
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        prediction, lb_loss, z_loss = dit(z_t, t, text_hidden, text_mask, checkpoint_blocks=True)
+        if capture:
+            prediction, lb_loss, z_loss = dit(z_t, t, text_hidden, text_mask, checkpoint_blocks=True, capture=True)
+            cond_captures = dit.last_captures
+        else:
+            prediction, lb_loss, z_loss = dit(z_t, t, text_hidden, text_mask, checkpoint_blocks=True)
         mse = F.mse_loss(prediction.float(), target_velocity.float())
     lb_loss = lb_loss.float()
     z_loss = z_loss.float()
     loss = mse + args.aux_loss_weight * lb_loss + args.z_loss_weight * z_loss
+    extra = {}
+    if args.use_sim_loss:
+        sim_loss = torch.stack(
+            [router_similarity_loss(probs, idx, dit.num_experts) for probs, idx, _ in cond_captures]
+        ).mean()
+        loss = loss + args.sim_loss_weight * sim_loss
+        extra["sim"] = float(sim_loss.detach().item())
+    if args.use_sage:
+        # Paired unconditional pass on the same x_t and t, with the null prompt for every sample.
+        batch_size = text_hidden.shape[0]
+        null_text = null_emb_fit.unsqueeze(0).expand(batch_size, -1, -1)
+        null_text_mask = null_mask_fit.unsqueeze(0).expand(batch_size, -1)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            dit(z_t, t, null_text, null_text_mask, checkpoint_blocks=True, capture=True)
+            uncond_captures = dit.last_captures
+        sage_terms = [
+            sage_loss(f_c, f_u, k_split=args.sage_k_split)
+            for (_, _, f_c), (_, _, f_u) in zip(cond_captures, uncond_captures)
+        ]
+        sage = torch.stack(sage_terms).mean()
+        loss = loss + args.sage_weight * sage
+        extra["sage"] = float(sage.detach().item())
     if not torch.isfinite(loss).item():
         optimizer.zero_grad(set_to_none=True)
         return None, int(dropped)
@@ -200,7 +236,7 @@ def train_step(dit, ema, optimizer, scaler, batch, null_emb_full, null_mask_full
         return None, int(dropped)
     update_ema(ema, dit, args.ema_decay)
     stats = {"loss": float(loss.item()), "mse": float(mse.item()),
-             "lb": float(lb_loss.item()), "z": float(z_loss.item())}
+             "lb": float(lb_loss.item()), "z": float(z_loss.item()), **extra}
     return stats, int(dropped)
 
 
@@ -453,6 +489,17 @@ def parse_args():
     parser.add_argument("--expert-hidden-dim", type=int, default=MOE_EXPERT_HIDDEN)
     parser.add_argument("--aux-loss-weight", type=float, default=0.01)
     parser.add_argument("--z-loss-weight", type=float, default=0.001)
+    # Off by default. The baseline runs with neither flag.
+    parser.add_argument("--use-sim-loss", action="store_true",
+                        help="Add the router similarity loss (Expert Race). Default off.")
+    parser.add_argument("--sim-loss-weight", type=float, default=1e-4,
+                        help="Weight on the router similarity loss, averaged over layers. Default 1e-4.")
+    parser.add_argument("--use-sage", action="store_true",
+                        help="Add the SAGE subspace loss. Costs an extra unconditional forward. Default off.")
+    parser.add_argument("--sage-k-split", type=int, default=2,
+                        help="SAGE split factor: basis size is d_model // k_split. Paper value: 2.")
+    parser.add_argument("--sage-weight", type=float, default=1.0,
+                        help="Weight on SAGE, averaged over layers. Paper value: 1.0.")
     parser.add_argument("--capacity-factor", type=float, default=MOE_CAPACITY_FACTOR)
     return parser.parse_args()
 
@@ -564,6 +611,7 @@ def main():
 
     window = None
     run_total = run_mse = run_lb = run_z = 0.0
+    run_reg = {"sage": 0.0, "sim": 0.0}
     run_count = 0
     dropped_total = 0
     seen_total = 0
@@ -588,6 +636,8 @@ def main():
                 run_mse += stats["mse"]
                 run_lb += stats["lb"]
                 run_z += stats["z"]
+                for key in run_reg:
+                    run_reg[key] += stats.get(key, 0.0)
                 run_count += 1
 
             if step % LOG_EVERY == 0:
@@ -598,7 +648,10 @@ def main():
                 print(f"step={step} loss={loss_out:.4f} ema_drift={drift:.4f} dropped={dropped_frac:.3f}")
                 print(f"[aux] step={step} mse={run_mse / n:.4f} lb={run_lb / n:.4f} z={run_z / n:.4f} "
                       f"route_dropped={dit.dropped_fraction():.4f}")
+                if args.use_sage or args.use_sim_loss:
+                    print(f"[reg] step={step} sage={run_reg['sage'] / n:.4f} sim={run_reg['sim'] / n:.6f}")
                 run_total = run_mse = run_lb = run_z = 0.0
+                run_reg = {"sage": 0.0, "sim": 0.0}
                 run_count = 0
                 dropped_total = 0
                 seen_total = 0
